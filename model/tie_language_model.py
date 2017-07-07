@@ -2,9 +2,11 @@ import torch
 import torch.nn as nn
 from torch.autograd import Variable
 
+from .yellowfin import YFOptimizer
+
 import os
 import time
-
+import math
 
 class TiedLanguageModel(torch.nn.Module):
     def __init__(self, num_token, dim, rnn_type, num_layers, dropout=0.5):
@@ -102,9 +104,10 @@ class Dict(object):
 
 
 class Corpus(object):
-    def __init__(self, paths, vocab_size=10000):
+    def __init__(self, paths, vocab_size):
         self.dict = Dict.build(paths, vocab_size)
         self.vocab_size = self.dict.vocabSize()
+        print("vocab_size = ", self.vocab_size)
 
     def data(self, path):
         assert os.path.exists(path)
@@ -126,23 +129,32 @@ class Corpus(object):
 
 class HyperParam(object):
     def __init__(self):
-        self.vocab_size = 10000
-        self.batch_size = 32
-        self.dim = 1024
-        self.num_layers = 1
+        self.vocab_size = 50000
+        self.batch_size = 20
+        self.dim = 650
+        self.num_layers = 2
         self.rnn_type = 'LSTM'
         self.dropout = 0.5
-        self.cuda = False
+        self.cuda = True
         self.bptt = 35
         self.clip = 0.25
-        self.lr = 0.1
-        self.opt_method = 'adam'
+        self.lr = 0.001
+        self.opt_method = 'YF'
         self.model_prefix = 'model/lm'
         self.logdir = 'log'
-        self.epochs = 10
+        self.epochs = 40
+        self.seed = 1111
 
 
 hyperParam = HyperParam()
+
+# Set the random seed manually for reproducibility.
+torch.manual_seed(hyperParam.seed)
+if torch.cuda.is_available():
+    if not hyperParam.cuda:
+        print("WARNING: You have a CUDA device, so you should probably run with --cuda")
+    else:
+        torch.cuda.manual_seed(hyperParam.seed)
 
 corpus = Corpus(['penn/train.txt', 'penn/valid.txt', 'penn/test.txt'], hyperParam.vocab_size)
 
@@ -172,14 +184,15 @@ model = TiedLanguageModel(num_token=corpus.vocab_size,
                           dropout=hyperParam.dropout)
 
 if hyperParam.cuda:
-    train_data.cuda()
-    valid_data.cuda()
-    test_data.cuda()
+    train_data = train_data.cuda()
+    valid_data = valid_data.cuda()
+    test_data = test_data.cuda()
     model.cuda()
 
 num_token = corpus.vocab_size
 criterion = nn.CrossEntropyLoss()
 
+lr = hyperParam.lr
 
 def getBatch(data, i, evaluation=False):
     seqLen = min(hyperParam.bptt, len(data) - 1 - i)
@@ -228,9 +241,9 @@ def train(epoch, optimizer):
         if batch % log_interval == 0 and batch > 0:
             curr_loss = total_loss[0] / log_interval
             elapsed = time.time() - start_time
-            print('| epoch {:3d} | {:5d}/{:5d} batches | ms/batch {:5.2f} | '
+            print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:3.5f} | ms/batch {:5.2f} |' 
                   'loss {:5.2f} | ppl {:8.2f}'.format(
-                epoch, batch, len(train_data) // hyperParam.bptt,
+                epoch, batch, len(train_data) // hyperParam.bptt,  lr,
                               elapsed * 1000 / log_interval, curr_loss, math.exp(curr_loss)))
             total_loss = 0
             start_time = time.time()
@@ -240,9 +253,11 @@ def train(epoch, optimizer):
 
 def get_optimizer(model):
     if hyperParam.opt_method == 'Adam':
-        optimizer = torch.optim.Adam(model.parameters(), lr=hyperParam.lr)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    elif hyperParam.opt_method == 'YF':
+        optimizer = YFOptimizer(model.parameters(), lr=1.0, mu=0.0)
     else:
-        optimizer = torch.optim.SGD(model.parameters(), lr=hyperParam.lr)
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr)
 
     return optimizer
 
@@ -252,9 +267,9 @@ def evaluation(model, data):
     total_loss = 0
     hidden = model.init_hidden(hyperParam.batch_size)
     for i in range(0, data.size(0) - 1, hyperParam.bptt):
-        data, targets = getBatch(data, i)
-        output, hidden = model(data, hidden)
-        total_loss += len(data) * criterion(output.view(-1, num_token), targets)
+        batch, targets = getBatch(data, i, evaluation=True)
+        output, hidden = model(batch, hidden)
+        total_loss += len(batch) * criterion(output.view(-1, num_token), targets).data
         hidden = repackage_hidden(hidden)
     return total_loss[0] / len(data)
 
@@ -271,13 +286,25 @@ for epoch in range(1, hyperParam.epochs):
     val_loss = evaluation(model, valid_data)
     val_loss_list.append(val_loss)
 
+    print('-' * 89)
+    print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
+          'valid ppl {:8.2f}'.format(epoch,
+                                     (time.time() - epoch_start_time),
+                                     val_loss, math.exp(val_loss)))
+    print('-' * 89)
+
     if best_val_loss is None or val_loss < best_val_loss:
         with open(hyperParam.model_prefix, 'wb') as f:
             torch.save(model, f)
         best_val_loss = val_loss
     else:
-        for group in optimizer.param_groups():
-            group['lr'] /= 4.0
+        # Anneal the learning rate if no improvement has been seen in the validation dataset.
+        lr /= 4.0
+        if hyperParam.opt_method == "YF":
+            optimizer.set_lr_factor(optimizer.get_lr_factor() / 4.0)
+        else:
+            for group in optimizer.param_groups:
+                group['lr'] /= 4.0
 
     import numpy as np
 
@@ -287,4 +314,4 @@ for epoch in range(1, hyperParam.epochs):
         np.savetxt(f, np.array(val_loss_list))
 
 test_loss = evaluation(model, test_data)
-print('test loss {:5.2f}'.format(test_loss))
+print('test loss {:5.2f} | ppl {:5.2f}'.format(test_loss, math.exp(test_loss)))
