@@ -1,12 +1,15 @@
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
+from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence, PackedSequence
 
 from .yellowfin import YFOptimizer
 
 import os
 import time
 import math
+import random
+
 
 class TiedLanguageModel(torch.nn.Module):
     def __init__(self, num_token, dim, rnn_type, num_layers, dropout=0.5):
@@ -43,11 +46,12 @@ class TiedLanguageModel(torch.nn.Module):
         self.decoder.weight.data.uniform_(-init_range, init_range)
 
     def forward(self, input, hidden):
+        input, lens = input
         emb = self.dropout(self.encoder(input))
-        output, hidden = self.rnn(emb, hidden)
-        output = self.dropout(output)
-        decoded = self.decoder(output.view(output.size(0) * output.size(1), output.size(2)))
-        return decoded.view(output.size(0), output.size(1), -1), hidden
+        output, hidden = self.rnn(PackedSequence(emb, lens), hidden)
+        output = self.dropout(output.data)
+        decoded = self.decoder(output)
+        return decoded, hidden
 
     def init_hidden(self, batch_size):
         weight = next(self.parameters()).data
@@ -107,38 +111,28 @@ class Corpus(object):
     def __init__(self, paths, vocab_size):
         self.dict = Dict.build(paths, vocab_size)
         self.vocab_size = self.dict.vocabSize()
-        print("vocab_size = ", self.vocab_size)
 
     def data(self, path):
-        assert os.path.exists(path)
+        sents = []
         with open(path, 'r') as file:
-            num_tokens = 0
             for line in file:
-                num_tokens += len(line.split()) + 1
-
-        ids = torch.LongTensor(num_tokens)
-        with open(path, 'r') as file:
-            token = 0
-            for line in file:
-                for word in line.split() + ['eos']:
-                    ids[token] = self.dict.getId(word)
-                    token += 1
-
-        return ids
+                sents.append([self.dict.getId(word) for word in line.split() + ['eos']])
+        sents = sorted(sents, key=lambda sen: len(sen))
+        return sents
 
 
 class HyperParam(object):
     def __init__(self):
         self.vocab_size = 50000
-        self.batch_size = 20
-        self.dim = 650
+        self.batch_size = 32
+        self.dim = 1024
         self.num_layers = 2
         self.rnn_type = 'LSTM'
-        self.dropout = 0.5
+        self.dropout = 0.6
         self.cuda = True
         self.bptt = 35
         self.clip = 0.25
-        self.lr = 0.001
+        self.lr = 0.01
         self.opt_method = 'YF'
         self.model_prefix = 'model/lm'
         self.logdir = 'log'
@@ -156,6 +150,7 @@ if torch.cuda.is_available():
     else:
         torch.cuda.manual_seed(hyperParam.seed)
 
+
 corpus = Corpus(['penn/train.txt', 'penn/valid.txt', 'penn/test.txt'], hyperParam.vocab_size)
 
 train_data = corpus.data('penn/train.txt')
@@ -164,18 +159,28 @@ test_data = corpus.data('penn/test.txt')
 
 
 def batchify(data, batch_size):
-    num_batch = len(data) // batch_size
+    return [sorted(data[begin:begin + batch_size], key=lambda sen: len(sen), reverse=True)
+                           for begin in range(0, len(data), batch_size)]
+
+
+'''
+def batchify(data, batch_size):
+    num_batch = data.size(0) // batch_size
 
     data = data.narrow(0, 0, num_batch * batch_size)
     data = data.view(batch_size, -1).t().contiguous()
 
     return data
-
+'''
 
 log_interval = 100
 train_data = batchify(train_data, hyperParam.batch_size)
 valid_data = batchify(valid_data, hyperParam.batch_size)
 test_data = batchify(test_data, hyperParam.batch_size)
+
+random.shuffle(train_data)
+random.shuffle(valid_data)
+random.shuffle(test_data)
 
 model = TiedLanguageModel(num_token=corpus.vocab_size,
                           dim=hyperParam.dim,
@@ -184,9 +189,9 @@ model = TiedLanguageModel(num_token=corpus.vocab_size,
                           dropout=hyperParam.dropout)
 
 if hyperParam.cuda:
-    train_data = train_data.cuda()
-    valid_data = valid_data.cuda()
-    test_data = test_data.cuda()
+    #train_data = train_data.cuda()
+    #valid_data = valid_data.cuda()
+    #test_data = test_data.cuda()
     model.cuda()
 
 num_token = corpus.vocab_size
@@ -194,19 +199,25 @@ criterion = nn.CrossEntropyLoss()
 
 lr = hyperParam.lr
 
-def getBatch(data, i, evaluation=False):
-    seqLen = min(hyperParam.bptt, len(data) - 1 - i)
-    batch = Variable(data[i:i + seqLen], volatile=evaluation)
-    targets = Variable(data[i + 1:i + 1 + seqLen].view(-1))
-    return batch, targets
+def getBatch(batch, evaluation=False):
+    lens = [len(i)-1 for i in batch]
+    max_step = len(batch[0])
+    input = torch.LongTensor(max_step, len(batch)).fill_(0)
+    targets = torch.LongTensor(max_step, len(batch)).fill_(0)
+    for b in range(0, len(batch)):
+        for step in range(0, len(batch[b])-1):
+            input[step][b] = batch[b][step]
+            targets[step][b] = batch[b][step+1]
 
+    return pack_padded_sequence(Variable(input).cuda(), lens), pack_padded_sequence(Variable(targets).cuda(), lens)
 
+'''
 def repackage_hidden(h):
     if type(h) == Variable:
         return Variable(h.data)
     else:
         return tuple(repackage_hidden(v) for v in h)
-
+'''
 
 def train(epoch, optimizer):
     model.train()
@@ -216,36 +227,38 @@ def train(epoch, optimizer):
     start_time = time.time()
 
     num_token = corpus.vocab_size
-    hidden = model.init_hidden(hyperParam.batch_size)
+    #hidden = model.init_hidden(hyperParam.batch_size)
 
     train_loss_list = []
+    stat_tokens = 0
+    for i, batch in enumerate(train_data):
+        input, targets = getBatch(batch)
 
-    for batch, i in enumerate(range(0, train_data.size(0) - 1, hyperParam.bptt)):
-        data, targets = getBatch(train_data, i)
-
-        hidden = repackage_hidden(hidden)
+        #hidden = repackage_hidden(hidden)
         model.zero_grad()
-        output, hidden = model(data, hidden)
-        loss = criterion(output.view(-1, num_token), targets)
+        output, hidden = model(input, hidden=None)
+        loss = criterion(output, targets.data)
         loss.backward()
 
         torch.nn.utils.clip_grad_norm(model.parameters(), hyperParam.clip)
 
         optimizer.step()
 
+        stat_tokens += len(targets.data)
         total_loss += loss.data
 
         train_loss_list.append(loss.data[0])
 
         import math
-        if batch % log_interval == 0 and batch > 0:
+        if i % log_interval == 0 and i > 0:
             curr_loss = total_loss[0] / log_interval
             elapsed = time.time() - start_time
-            print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:3.5f} | ms/batch {:5.2f} |' 
+            print('| epoch {:3d} | {:5d}/{:5d} batches | ms/batch {:5.2f} | '
                   'loss {:5.2f} | ppl {:8.2f}'.format(
-                epoch, batch, len(train_data) // hyperParam.bptt,  lr,
+                epoch, i, len(train_data),
                               elapsed * 1000 / log_interval, curr_loss, math.exp(curr_loss)))
             total_loss = 0
+            stat_tokens = 0
             start_time = time.time()
 
     return train_loss_list
@@ -265,13 +278,13 @@ def get_optimizer(model):
 def evaluation(model, data):
     model.eval()
     total_loss = 0
-    hidden = model.init_hidden(hyperParam.batch_size)
-    for i in range(0, data.size(0) - 1, hyperParam.bptt):
-        batch, targets = getBatch(data, i, evaluation=True)
-        output, hidden = model(batch, hidden)
-        total_loss += len(batch) * criterion(output.view(-1, num_token), targets).data
-        hidden = repackage_hidden(hidden)
-    return total_loss[0] / len(data)
+    total_tokens = 0
+    for batch in data:
+        input, targets = getBatch(batch, evaluation=True)
+        output, hidden = model(input, hidden=None)
+        total_loss += len(targets.data) * criterion(output, targets.data).data
+        total_tokens += len(targets.data)
+    return total_loss[0] / total_tokens
 
 
 optimizer = get_optimizer(model)
