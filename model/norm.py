@@ -3,18 +3,14 @@ import torch
 from torch import nn
 
 class LayerNorm(nn.Module):
-    def __init__(self, epsilon=1e-6):
+    def __init__(self, dim, epsilon=1e-6):
         super(LayerNorm, self).__init__()
-        self.scale = nn.Parameter(torch.Tensor(1))
-        self.bias = nn.Parameter(torch.Tensor(1))
+        self.alpha = nn.Parameter(torch.zeros(dim))
+        self.beta = nn.Parameter(torch.ones(dim))
         self.epsilon = epsilon
-
-    def reset_parameters(self):
-        self.scale.data.fill_(1.0)
-        self.bias.data.fill_(0.0)
 
     def forward(self, input):
         mean = input.mean(-1)
-        variance = input.var(-1) + self.epsilon
-        norm = (input - mean) / torch.sqrt(variance)
-        return norm * self.scale + self.bias
+        std = input.std(-1)
+        norm = (input - mean.expand_as(input)) / (std.expand_as(input) + self.epsilon)
+        return self.alpha.expand_as(input) * norm + self.beta.expand_as(input)

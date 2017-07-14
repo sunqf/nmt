@@ -2,8 +2,9 @@ import torch
 import torch.nn as nn
 from torch.autograd import Variable
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence, PackedSequence
-
+from .embedding import PositionEmbedding, Embedding
 from .yellowfin import YFOptimizer
+from .attention import MultiHeadAttention
 
 import os
 import time
@@ -17,21 +18,26 @@ class TiedLanguageModel(torch.nn.Module):
 
         self.dropout = torch.nn.Dropout(dropout)
 
-        self.encoder = torch.nn.Embedding(num_token, dim, padding_idx=0)
+        #self.encoder = torch.nn.Embedding(num_token, dim, padding_idx=0)
+        self.pos_embedding = PositionEmbedding(dim, max_length=1000)
+        self.word_embedding = torch.nn.Embedding(num_token, dim, padding_idx=0)
+        self.embedding = Embedding(self.word_embedding, dim, pos_embedding=self.pos_embedding)
 
         if rnn_type in ['LSTM', 'GRU']:
-            self.rnn = getattr(torch.nn, rnn_type)(dim, dim, num_layers, dropout=dropout)
+            self.encoder = getattr(torch.nn, rnn_type)(dim, dim, num_layers, dropout=dropout)
+        elif rnn_type == 'self-att':
+            self.encoder = MultiHeadAttention(dim, dim, num_heads=8, dropout=dropout)
         else:
             try:
                 nonlinearity = {'RNN_TANH': 'tanh', 'RNN_RELU': 'relu'}[rnn_type]
             except KeyError:
                 raise ValueError("""An invalid option for '--model' was supplied,
                                  options are ['LSTM', 'GRU', 'RNN_TANH' or 'RNN_RELU']""")
-            self.rnn = torch.nn.RNN(dim, dim, num_layers, nonlinearity=nonlinearity, dropout=dropout)
+            self.encoder = torch.nn.RNN(dim, dim, num_layers, nonlinearity=nonlinearity, dropout=dropout)
 
         self.decoder = nn.Linear(dim, num_token)
 
-        self.decoder.weight = self.encoder.weight
+        self.decoder.weight = self.word_embedding.weight
 
         self.rnn_type = rnn_type
         self.dim = dim
@@ -41,14 +47,27 @@ class TiedLanguageModel(torch.nn.Module):
 
     def init_weights(self):
         init_range = 0.1
-        self.encoder.weight.data.uniform_(-init_range, init_range)
+        #self.encoder.weight.data.uniform_(-init_range, init_range)
         self.decoder.bias.data.fill_(0)
         self.decoder.weight.data.uniform_(-init_range, init_range)
 
     def forward(self, input, hidden):
-        input, lens = input
-        emb = self.dropout(self.encoder(input))
-        output, hidden = self.rnn(PackedSequence(emb, lens), hidden)
+        #input, lens = input
+        emb, lens = pad_packed_sequence(self.embedding(input), batch_first=True)
+        emb = self.dropout(emb)
+        if self.rnn_type == 'self-att':
+            # batch * max_len * max_len
+            max_len = lens[0]
+            mask = torch.zeros(len(lens), lens[0], lens[0]).type(torch.ByteTensor).cuda()
+            for i, length in enumerate(lens):
+                if length < max_len:
+                    mask[i, length:, length:] = 1
+
+            output, attention = self.encoder(emb, emb, emb, masks=mask)
+            output = pack_padded_sequence(output, lens, batch_first=True)
+            hidden = output
+        else:
+            output, hidden = self.encoder(pack_padded_sequence(emb, lens, batch_first=True), hidden)
         output = self.dropout(output.data)
         decoded = self.decoder(output)
         return decoded, hidden
@@ -127,7 +146,7 @@ class HyperParam(object):
         self.batch_size = 32
         self.dim = 1024
         self.num_layers = 2
-        self.rnn_type = 'LSTM'
+        self.rnn_type = 'self-att'
         self.dropout = 0.6
         self.cuda = True
         self.bptt = 35
@@ -236,7 +255,7 @@ def train(epoch, optimizer):
 
         #hidden = repackage_hidden(hidden)
         model.zero_grad()
-        output, hidden = model(input, hidden=None)
+        output, _ = model(input, hidden=None)
         loss = criterion(output, targets.data)
         loss.backward()
 
