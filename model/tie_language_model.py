@@ -58,12 +58,12 @@ class TiedLanguageModel(torch.nn.Module):
         if self.rnn_type == 'self-att':
             # batch * max_len * max_len
             max_len = lens[0]
-            mask = torch.zeros(len(lens), lens[0], lens[0]).type(torch.ByteTensor).cuda()
+            masks = torch.zeros(len(lens), lens[0], lens[0]).type(torch.ByteTensor)
             for i, length in enumerate(lens):
                 if length < max_len:
-                    mask[i, length:, length:] = 1
+                    masks[i, length:, length:] = 1
 
-            output, attention = self.encoder(emb, emb, emb, masks=mask)
+            output, attention = self.encoder(emb, emb, emb, masks=masks)
             output = pack_padded_sequence(output, lens, batch_first=True)
             hidden = output
         else:
@@ -132,10 +132,9 @@ class Corpus(object):
         self.vocab_size = self.dict.vocabSize()
 
     def data(self, path):
-        sents = []
         with open(path, 'r') as file:
-            for line in file:
-                sents.append([self.dict.getId(word) for word in line.split() + ['eos']])
+            sents = [[self.dict.getId(word) for word in line.split() + ['eos']]
+                     for line in file]
         sents = sorted(sents, key=lambda sen: len(sen))
         return sents
 
@@ -148,7 +147,7 @@ class HyperParam(object):
         self.num_layers = 2
         self.rnn_type = 'self-att'
         self.dropout = 0.6
-        self.cuda = True
+        self.cuda = False
         self.bptt = 35
         self.clip = 0.25
         self.lr = 0.01
@@ -228,7 +227,7 @@ def getBatch(batch, evaluation=False):
             input[step][b] = batch[b][step]
             targets[step][b] = batch[b][step+1]
 
-    return pack_padded_sequence(Variable(input).cuda(), lens), pack_padded_sequence(Variable(targets).cuda(), lens)
+    return pack_padded_sequence(Variable(input), lens), pack_padded_sequence(Variable(targets), lens)
 
 '''
 def repackage_hidden(h):

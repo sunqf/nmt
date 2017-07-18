@@ -11,7 +11,7 @@ class ScaledDotProduct(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.softmax = nn.Softmax()
 
-    def forward(self, q, k, v, mask=None):
+    def forward(self, q, k, v, masks=None):
         batch_q, len_q, dim_q = list(q.size())
         batch_k, len_k, dim_k = list(k.size())
         batch_v, len_v, dim_v = list(v.size())
@@ -23,8 +23,8 @@ class ScaledDotProduct(nn.Module):
         qk = torch.bmm(q, k.transpose(1, 2)) # batch_q * len_q * len_k
         qk = qk / (dim_k ** 0.5)
 
-        if mask is not None:
-            qk.data.masked_fill_(mask, -float('inf'))
+        if masks is not None:
+            qk.data.masked_fill_(masks, -float('inf'))
 
         attention = self.softmax(qk.view(-1, len_k)).view(batch_q, len_q, len_k)
         attention = self.dropout(attention)
@@ -53,6 +53,7 @@ class MultiHeadAttention(nn.Module):
                                  nn.Dropout(dropout),
                                  nn.Linear(output_size, output_size))
         self.layer_norm2 = LayerNorm(output_size)
+
 
     def forward(self, q, k, v, masks=None):
         '''
@@ -105,6 +106,6 @@ class MultiHeadAttention(nn.Module):
         output = self.layer_norm1(residual + unmulti_head(output))
 
         # feed forward & add & norm
-        residual = output
-        output = self.layer_norm2(residual + self.ffn(output.view(-1, output.size(-1))).view_as(residual))
+        #residual = output
+        #output = self.layer_norm2(residual + self.ffn(output.view(-1, output.size(-1))).view_as(residual))
         return output, attention
