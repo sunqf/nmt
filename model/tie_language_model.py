@@ -24,9 +24,9 @@ class TiedLanguageModel(torch.nn.Module):
         self.embedding = Embedding(self.word_embedding, dim, pos_embedding=self.pos_embedding)
 
         if rnn_type in ['LSTM', 'GRU']:
-            self.encoder = getattr(torch.nn, rnn_type)(dim, dim, num_layers, dropout=dropout)
+            self.encoder = getattr(torch.nn, rnn_type)(dim, dim, num_layers, dropout=0.6)
         elif rnn_type == 'self-att':
-            self.encoder = MultiHeadAttention(dim, dim, num_heads=8, dropout=dropout)
+            self.encoder = MultiHeadAttention(dim, dim, num_heads=8, dropout=0.4)
         else:
             try:
                 nonlinearity = {'RNN_TANH': 'tanh', 'RNN_RELU': 'relu'}[rnn_type]
@@ -58,7 +58,7 @@ class TiedLanguageModel(torch.nn.Module):
         if self.rnn_type == 'self-att':
             # batch * max_len * max_len
             max_len = lens[0]
-            masks = torch.zeros(len(lens), lens[0], lens[0]).type(torch.ByteTensor)
+            masks = torch.zeros(len(lens), lens[0], lens[0]).type(torch.ByteTensor).cuda()
             for i, length in enumerate(lens):
                 if length < max_len:
                     masks[i, length:, length:] = 1
@@ -147,7 +147,7 @@ class HyperParam(object):
         self.num_layers = 2
         self.rnn_type = 'self-att'
         self.dropout = 0.6
-        self.cuda = False
+        self.cuda = True
         self.bptt = 35
         self.clip = 0.25
         self.lr = 0.01
@@ -227,7 +227,7 @@ def getBatch(batch, evaluation=False):
             input[step][b] = batch[b][step]
             targets[step][b] = batch[b][step+1]
 
-    return pack_padded_sequence(Variable(input), lens), pack_padded_sequence(Variable(targets), lens)
+    return pack_padded_sequence(Variable(input).cuda(), lens), pack_padded_sequence(Variable(targets).cuda(), lens)
 
 '''
 def repackage_hidden(h):

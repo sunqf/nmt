@@ -14,7 +14,6 @@ class PositionEmbedding(nn.Module):
     '''
     def __init__(self, dim, max_length=5000):
         super(PositionEmbedding, self).__init__()
-
         position_enc = np.array([
             [pos / np.power(10000, 2*i/dim) for i in range(dim)]
             for pos in range(max_length)])
@@ -22,11 +21,11 @@ class PositionEmbedding(nn.Module):
         position_enc[:, 0::2] = np.sin(position_enc[:, 0::2])
         position_enc[:, 1::2] = np.cos(position_enc[:, 1::2])
 
-        self.dim = dim
         self.weight = torch.from_numpy(position_enc).type(torch.FloatTensor).cuda()
 
     def forward(self, input):
-        return Variable(self.weight.index(input))
+        return Variable(self.weight.index(input.data))
+
 
 
 
@@ -45,11 +44,13 @@ class Embedding(nn.Module):
             self.activation = nn.ReLU()
             self.linear = nn.Linear(self.emb_dim + sum([emb_dim for _, _, emb_dim in feature_dict]), emb_dim)
 
-        self.pos_embedding = pos_embedding
+        if pos_embedding is not None:
+            self.pos_embedding = pos_embedding
 
 
     def forward(self, input):
         '''
+
         :param input: PackedSequence
         :return:
         '''
@@ -65,11 +66,12 @@ class Embedding(nn.Module):
 
             emb = self.activation(self.linear(torch.cat(emb + feats, -1)))
 
-        input_pos = torch.cat([torch.LongTensor([pos] * batch_size) for pos, batch_size in enumerate(batch_sizes)]).cuda()
+        if hasattr(self, 'pos_embedding'):
+            input_pos = torch.cat([torch.LongTensor([pos] * batch_size) for pos, batch_size in enumerate(batch_sizes)])
 
-        pos_emb = self.pos_embedding(input_pos)
+            pos_emb = self.pos_embedding(Variable(input_pos).cuda())
 
-        emb = emb + pos_emb
+            emb = emb + pos_emb
 
         return PackedSequence(emb, batch_sizes)
 

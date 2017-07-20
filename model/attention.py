@@ -50,8 +50,8 @@ class MultiHeadAttention(nn.Module):
 
         self.ffn = nn.Sequential(nn.Linear(output_size, output_size),
                                  nn.ReLU(inplace=True),
-                                 nn.Dropout(dropout),
-                                 nn.Linear(output_size, output_size))
+                                 nn.Linear(output_size, output_size),
+                                 nn.Dropout(dropout))
         self.layer_norm2 = LayerNorm(output_size)
 
 
