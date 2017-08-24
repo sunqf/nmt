@@ -4,19 +4,22 @@
 # people2014
 
 import os
+import re
 
-'''
+
 path = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/2014'
 
+pattern = re.compile('\[([^]]*)\]/[a-z]+')
 with open("people2014.txt", 'w') as dest:
     for subdir in os.listdir(path):
         for file in os.listdir(os.path.join(path, subdir)):
             with open(os.path.join(path, subdir, file)) as f:
                 for line in f:
-                    dest.write(' '.join([item.rsplit('/', 1)[0].replace('[', '[ ') for item in line.replace(']', ' ]').split()]))
+                    line = pattern.sub('\\1', line)
+                    dest.write(' '.join([item.rsplit('/', 1)[0] for item in line.split()]))
                     dest.write('\n')
 
-'''
+
 '''
     The following is a lit of files that are double-annotated and can be
     regarded as gold standard files.
@@ -47,6 +50,7 @@ with open("people2014.txt", 'w') as dest:
     
     Total: 114 files, 63,223 words (12.46% of the corpus)
 '''
+'''
 ctb_path = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/ctb8.0/data/segmented'
 gold_file = [
     'chtb_1018.mz.seg', 'chtb_1020.mz.seg', 'chtb_1036.mz.seg',
@@ -74,3 +78,5 @@ with open('ctb.train', 'w') as train, open('ctb.gold', 'w') as gold:
                         gold.write(line)
                     else:
                         train.write(line)
+
+'''
