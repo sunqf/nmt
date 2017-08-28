@@ -1,7 +1,10 @@
 
 import os
-import collections
+import itertools
+from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence, PackedSequence
 
+paths = ['/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/train/train.all']
+'''
 def split_to_single(text):
     for word in text.split():
         for ch in word:
@@ -54,7 +57,7 @@ class Dict(object):
 
         return Dict(list([word for word, count in word_counts]))
 
-paths = ['/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/train/train.all']
+
 
 
 word_counts = count_word(paths)
@@ -74,7 +77,7 @@ def tag(pos, seq_len):
     else:
         return 'I'
 
-def load(corpus_paths, dict):
+def load(corpus_paths):
     for path in corpus_paths:
         assert os.path.exists(path)
         with open(path, 'r') as file:
@@ -89,80 +92,133 @@ def load(corpus_paths, dict):
 training_data = list(load(paths, dict))
 import random
 random.shuffle(training_data)
+'''
 
 import torch
 import torch.autograd as autograd
 import torch.nn as nn
 import torch.optim as optim
 
-def log_sum_exp_torch(vecs, axis=None):
-    ## Use help from: http://pytorch.org/tutorials/beginner/nlp/advanced_tutorial.html#sphx-glr-beginner-nlp-advanced-tutorial-py
-    if axis < 0:
-        axis = vecs.ndimension() + axis
+def log_sum_exp(vecs, axis):
     max_val, _ = vecs.max(axis)
-    vecs = vecs - max_val.view(-1, 1)
+    vecs = vecs - max_val.unsqueeze(axis)
     out_val = torch.log(torch.exp(vecs).sum(axis))
     # print(max_val, out_val)
     return max_val + out_val
 
+class Embedding(nn.Module):
 
-def log_sum_exp_2d(vecs, axis):
-    max_val, _ = vecs.max(axis)
-    vecs = vecs - max_val.view(-1, 1)
-    out_val = torch.log(torch.exp(vecs).sum(axis))
-    # print(max_val, out_val)
-    return max_val + out_val
+    def __init__(self, word_embedding, emb_dim, feature_dict=None):
+        super(Embedding, self).__init__()
 
-def log_sum_exp_1d(vecs, axis):
-    max_val, _ = vecs.max(axis)
-    vecs = vecs - max_val
-    out_val = torch.log(torch.exp(vecs).sum(axis))
-    # print(max_val, out_val)
-    return max_val + out_val
+        self.word_embedding = word_embedding
+        if feature_dict is not None:
+            self.feature_dict = feature_dict
+            self.feature_embeddings = [nn.Embedding(num_emb, emb_dim, padding_idx=0)
+                                       for feature_name, num_emb, emb_dim in feature_dict]
+
+            self.activation = nn.ReLU()
+            self.linear = nn.Linear(self.emb_dim + sum([emb_dim for _, _, emb_dim in feature_dict]), emb_dim)
+
+
+    def forward(self, input):
+        '''
+        :param input: PackedSequence
+        :return:
+        '''
+        input, batch_sizes = input
+
+        if input.dim() == 3:
+            emb = self.word_embedding(input[:, :, 0])
+        else:
+            emb = self.word_embedding(input)
+
+        if hasattr(self, 'feature_dict'):
+            feats = [feature_embedding(input[:, :, i+1]) for i, feature_embedding in enumerate(self.feature_dict)]
+
+            emb = self.activation(self.linear(torch.cat(emb + feats, -1)))
+
+        return PackedSequence(emb, batch_sizes)
 
 
 
 class CRFLayer(nn.Module):
-    def __init__(self, feature_dim, num_labels, start_tag, end_tag):
+    def __init__(self, feature_dim, num_labels):
         super(CRFLayer, self).__init__()
         self.hidden_dim = feature_dim
         self.num_labels = num_labels
-        self.start_tag = start_tag
-        self.end_tag = end_tag
         self.feature2labels = nn.Linear(feature_dim, num_labels)
+        self.start_transition = nn.Parameter(torch.randn(self.num_labels))
+        # tags[i + 1] -> tags[i]
         self.transitions = nn.Parameter(torch.randn(self.num_labels, self.num_labels))
-
-        self.transitions.data[self.start_tag, :] = -10000.0
-        self.transitions.data[:, self.end_tag] = -10000.0
+        self.end_transition = nn.Parameter(torch.randn(self.num_labels))
 
     def _forward_alg(self, emissions):
-        scores = self.transitions[:, self.start_tag] + emissions[0]
+        '''
+        :param emissions: PackedSequence
+        :return:
+        '''
+        emissions, batch_sizes = emissions
+        scores = emissions[0:batch_sizes[0]] + self.start_transition
+        emission_offset = batch_sizes[0]
         # Get the log sum exp score
-        for i in range(1, emissions.size(0)):
-            scores = emissions[i] + log_sum_exp_2d(scores + self.transitions, axis=-1)
-        scores = scores + self.transitions[self.end_tag]
-        return log_sum_exp_1d(scores, axis=-1)
+        for i in range(1, len(batch_sizes)):
+            scores[:batch_sizes[i]] = emissions[emission_offset:emission_offset+batch_sizes[i]] + \
+                                      log_sum_exp(scores[:batch_sizes[i]].view(batch_sizes[i], 1, self.num_labels) + self.transitions, axis=-1)
+            emission_offset += batch_sizes[i]
+        scores = scores + self.end_transition
+        return log_sum_exp(scores, axis=-1)
+
+    def _emission_select(self, emissions, batch_size, tags):
+        return emissions.gather(-1, tags[:batch_size].unsqueeze(-1)).squeeze(-1)
+
+    def _transition_select(self, batch_size, prev_tags, curr_tags):
+        return self.transitions.index_select(0, curr_tags).gather(1, prev_tags.unsqueeze(-1)).squeeze(-1)
 
     def _score_sentence(self, emissions, tags):
-        score = self.transitions[tags[0], self.start_tag] + emissions[0, tags[0]]
-        for i in range(0, emissions.size(0) - 1):
-            score = score + self.transitions[tags[i + 1], tags[i]] + emissions[i + 1, tags[i + 1]]
-        score = score + self.transitions[self.end_tag, tags[-1]]
+        '''
+
+        :param emissions: packedsequence
+        :param tags: packedsequence
+        :param batch_sizes:
+        :return:
+        '''
+        emissions, batch_sizes = emissions
+        tags, _ = tags
+        last_tags = tags[:batch_sizes[0]]
+        score = self.start_transition.gather(0, tags[0:batch_sizes[0]]) + \
+                self._emission_select(emissions[0:batch_sizes[0]], batch_sizes[0], last_tags)
+
+        emissions_offset = batch_sizes[0]
+        for i in range(1, len(batch_sizes)):
+            curr_tags = tags[emissions_offset:emissions_offset+batch_sizes[i]]
+            score[:batch_sizes[i]] = score[:batch_sizes[i]] + \
+                                     self._transition_select(batch_sizes[i], last_tags[:batch_sizes[i]], curr_tags) + \
+                                     self._emission_select(emissions[emissions_offset:emissions_offset+batch_sizes[i]], batch_sizes[i], curr_tags)
+            last_tags = last_tags.clone()
+            last_tags[:batch_sizes[i]] = curr_tags
+            emissions_offset += batch_sizes[i]
+        score = score + self.end_transition.gather(0, last_tags)
         return score
 
     def _viterbi_decode(self, emissions):
+        '''
+
+        :param emissions: [len, label_size]
+        :return:
+        '''
         emissions = emissions.data.cpu()
         scores = torch.zeros(emissions.size(-1))
         back_pointers = torch.zeros(emissions.size()).int()
         transitions = self.transitions.data.cpu()
-        scores = scores + transitions[:, self.start_tag] + emissions[0]
+        scores = scores + self.start_transition.data.cpu() + emissions[0]
         # Generate most likely scores and paths for each step in sequence
         for i in range(1, emissions.size(0)):
             scores_with_transitions = scores + transitions
             max_scores, back_pointers[i] = torch.max(scores_with_transitions, -1)
             scores = emissions[i] + max_scores
         # Generate the most likely path
-        scores = scores + transitions[self.end_tag]
+        scores = scores + self.end_transition.data.cpu()
         viterbi = [scores.numpy().argmax()]
         back_pointers = back_pointers.numpy()
         for bp in reversed(back_pointers[1:]):
@@ -172,14 +228,20 @@ class CRFLayer(nn.Module):
         return viterbi_score, viterbi
 
     def neg_log_likelihood(self, feats, tags):
-        emissions = self.feature2labels(feats)
+        '''
+
+        :param feats: PackedSequence
+        :param tags: PackedSequence
+        :return:
+        '''
+        emissions = PackedSequence(self.feature2labels(feats.data), feats.batch_sizes)
         forward_score = self._forward_alg(emissions)
         gold_score = self._score_sentence(emissions, tags)
-        return forward_score - gold_score
+        return (forward_score - gold_score).sum()
 
     def forward(self, feats):
         '''
-
+        unsupported batch process
         :param feats: [seqence length, feature size]
         :return: score, tag sequence
         '''
@@ -190,37 +252,29 @@ class CRFLayer(nn.Module):
 
 
 class BiLSTMCRF(nn.Module):
-    def __init__(self, vocab_size, num_label, start_tag, end_tag, embedding_dim, hidden_dim, dropout=0.5):
+    def __init__(self, vocab_size, num_label, embedding_dim, hidden_dim, dropout=0.5):
         super(BiLSTMCRF, self).__init__()
         self.embedding_dim = embedding_dim
         self.hidden_dim = hidden_dim
-        self.word_embeds = nn.Embedding(vocab_size, embedding_dim)
-        self.word_embeds_dropout = nn.Dropout(dropout)
+        word_embeds = nn.Embedding(vocab_size, embedding_dim)
+        self.input_embed = Embedding(word_embeds, self.embedding_dim)
         self.lstm = nn.LSTM(embedding_dim, hidden_dim // 2,
                             num_layers=1, bidirectional=True, dropout=dropout)
 
-        self.crf = CRFLayer(hidden_dim, num_label, start_tag, end_tag)
+        self.crf = CRFLayer(hidden_dim, num_label)
 
-    def init_hidden(self):
-        return (autograd.Variable(torch.randn(2, 1, self.hidden_dim // 2)),
-                autograd.Variable(torch.randn(2, 1, self.hidden_dim // 2)))
-
-    def _get_features(self, sentence):
+    def _get_features(self, input):
         '''
         :param sentence: [seq_len]
         :return: [seq_len, hidden_dim * 2]
         '''
-        length = sentence.size(0)
-        self.hidden = self.init_hidden()
-        embeds = self.word_embeds(sentence).view(len(sentence), -1)
-        embeds = self.word_embeds_dropout(embeds)
-        lstm_out, self.hidden = self.lstm(embeds, self.hidden)
-        lstm_feats = lstm_out.view(length, -1)
-        return lstm_feats
+        embeds = self.input_embed(input)
+        lstm_output, self.hidden = self.lstm(embeds, None)
+        return lstm_output
 
-    def forward(self, sentence):
-        feats = self._get_features(sentence)
-        return self.crf(feats)
+    def forward(self, sentences):
+        sentences, lens = pad_packed_sequence(self._get_features(sentences), batch_first=True)
+        return [self.crf(sentence[:len]) for sentence, len in zip(sentences, lens)]
 
     def neg_log_likelihood(self, sentence, tags):
         feats = self._get_features(sentence)
@@ -229,38 +283,105 @@ class BiLSTMCRF(nn.Module):
 
 torch.set_num_threads(10)
 
-# Make up some training data
+class Config:
+    def __init__(self):
+        self.max_vocab_size = 5000
+        self.batch_size = 16
+        self.embedding_size = 50
+        self.hidden_size = 50
+        self.dropout = 0.3
+        self.use_cuda = False
 
-word_to_ix = {}
-for sentence, tags in training_data:
-    for word in sentence:
-        if word not in word_to_ix:
-            word_to_ix[word] = len(word_to_ix)
+        self.data_root = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/'
+        self.train_paths = [os.path.join(self.data_root, 'train/train.all')]
+        self.eval_paths = [os.path.join(self.data_root, 'gold', path)
+                           for path in ['bosonnlp/auto_comments.txt', 'bosonnlp/food_comments.txt',
+                                        'bosonnlp/news.txt', 'bosonnlp/weibo.txt',
+                                        'ctb.gold', 'msr_test_gold.utf8',
+                                        'pku_test_gold.utf8']]
 
-START_TAG = "start"
-END_TAG = "end"
-tag_to_ix = {"B": 0, "I": 1, "E": 2, START_TAG: 3, END_TAG: 4}
-ix_to_tag = ['B', 'I', "E", START_TAG, END_TAG]
+        self.model_file = 'model/model'
 
-use_cuda = True
+config = Config()
 
-model = BiLSTMCRF(dict.vocabSize(), len(tag_to_ix), tag_to_ix[START_TAG], tag_to_ix[END_TAG], 50, 50, 0.3)
-if use_cuda:
+from .loader import DataLoader
+
+loader = DataLoader(config.train_paths, config.max_vocab_size)
+
+dict, tagger, training_data = loader.get_data(config.train_paths, config.batch_size)
+
+import random
+random.shuffle(training_data)
+
+model = BiLSTMCRF(len(dict), len(tagger), config.embedding_size, config.hidden_size, config.dropout)
+if config.use_cuda:
     model = model.cuda()
-optimizer = torch.optim.SGD(model.parameters(), lr=0.01, weight_decay=1e-4)
+    for sentences, batch_tags in training_data:
+        sentences.data = sentences.data.cuda()
+        batch_tags.data = batch_tags.data.cuda()
+
+#optimizer = torch.optim.SGD(model.parameters(), lr=0.01, weight_decay=1e-4)
+
+optimizer = torch.optim.Adam(model.parameters())
 
 
 
-def prepare_sequence(seq, dict):
-    idxs = [dict.getId(w) for w in seq]
-    tensor = torch.LongTensor(idxs)
-    return torch.autograd.Variable(tensor)
+eval_data = list(loader.batch(config.eval_paths, config.batch_size))
 
-training_data = [(prepare_sequence(sentence,dict), torch.LongTensor([tag_to_ix[t] for t in tags]))
-        for sentence, tags in training_data]
 
-if use_cuda:
-    training_data = [(sentence.cuda(), tags.cuda()) for sentence, tags in training_data]
+def unpack(pad_sequence):
+    seqs, lens = pad_packed_sequence(pad_sequence, batch_first=True)
+    return [seq[:len] for seq, len in zip(seqs, lens)]
+
+def evaluation_one(pred, gold):
+    count = 0
+    true = 0
+    pos = 0
+
+    start = 0
+    for curr in range(0, len(pred)):
+        if tagger.is_split(pred[curr]):
+            pos += 1
+
+        if tagger.is_split(gold[curr]):
+            flag = pred[curr] == gold[curr]
+            if flag:
+                for k in range(start, curr):
+                    if pred[k] != gold[k]:
+                        flag = False
+                        break
+                if flag:
+                    count += 1
+            true += 1
+            start = curr + 1
+
+    return count, true, pos
+
+
+def evaluation(model, data):
+
+    model.eval()
+    correct = 0
+    true = 0
+    pos = 0
+    for sentences, gold_tags in data:
+        pred = model(sentences)
+        gold_tags = unpack(gold_tags)
+
+        for pred, gold in zip(pred, gold_tags):
+            c, t, p = evaluation_one(pred[1], list(gold.data))
+            correct += c
+            true += t
+            pos += p
+
+    print('pos %d  true %d' % (pos, true))
+    prec = correct/float(pos)
+    recall = correct/float(true)
+    return prec, recall, 2*prec*recall/(prec+recall)
+
+
+
+
 
 # Make sure prepare_sequence from earlier in the LSTM section is loaded
 for epoch in range(10):  # again, normally you would NOT do 300 epochs, it is toy data
@@ -269,34 +390,44 @@ for epoch in range(10):  # again, normally you would NOT do 300 epochs, it is to
     import time
     start_time = time.time()
 
-    for index, (sentence, tags) in enumerate(training_data):
+    for index, (batch_sentence, batch_tags) in enumerate(training_data):
+        model.train()
         # Step 1. Remember that Pytorch accumulates gradients.
         # We need to clear them out before each instance
         model.zero_grad()
 
         # Step 2. Run our forward pass.
-        neg_log_likelihood = model.neg_log_likelihood(sentence, tags)
+        nll = model.neg_log_likelihood(batch_sentence, batch_tags)
 
-        loss += neg_log_likelihood.data[0]
+        loss += nll.data[0]
         # Step 3. Compute the loss, gradients, and update the parameters by
         # calling optimizer.step()
-        neg_log_likelihood.backward()
+        nll.backward()
+        torch.nn.utils.clip_grad_norm(model.parameters(), 0.25)
         optimizer.step()
 
         if index % 100 == 0:
 
+            model.eval()
             # sample
-            sentence, gold_tag = training_data[random.randint(0, len(training_data) - 1)]
-            pred_score, tag_ixs = model(sentence)
-            print(pred_score)
-            seg = ''.join([' ' + dict.getWord(word) if (ix_to_tag[ix]) == 'B' else dict.getWord(word)
-                           for word, ix in zip(list(sentence.data), list(tag_ixs))])
-            print('dst: %s' % seg)
+            sentences, gold_tags = training_data[random.randint(0, len(training_data) - 1)]
 
-            print('loss: %f, speed: %f' % (loss / 100, (time.time() - start_time) / 100))
+            for sentence, pred in zip(unpack(sentences), model(sentences)):
+                pred_score, tag_ixs = pred
+                print(pred_score)
+                seg = ''.join([dict.get_word(word) + ' ' if tagger.is_split(ix) else dict.get_word(word)
+                               for word, ix in zip(list(sentence.data), list(tag_ixs))])
+                print('dst: %s' % seg)
+
+            print('loss: %f, speed: %f' % (loss / (config.batch_size * 100), (time.time() - start_time) / (config.batch_size * 100)))
             loss = 0
             start_time = time.time()
 
+            # evaluation
+            print('eval prec: %f  recall: %f  F-score: %f' % evaluation(model, eval_data))
+
+    with open('%s.%d' % (config.model_file, epoch), 'wb') as f:
+        torch.save(model, f)
 
 # Check predictions after training
 # We got it!
