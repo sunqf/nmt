@@ -1,7 +1,9 @@
 
 import os
+import math
 import itertools
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence, PackedSequence
+from torch.autograd import Variable
 
 paths = ['/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/train/train.all']
 '''
@@ -250,18 +252,63 @@ class CRFLayer(nn.Module):
         score, tag_seq = self._viterbi_decode(emissions)
         return score, tag_seq
 
+class LanguageModel(nn.Module):
+
+    def __init__(self, dim, num_vocab, weight, bidirectional=True):
+        super(LanguageModel, self).__init__()
+        self.dim = dim
+        self.linear = nn.Linear(dim, num_vocab)
+        self.linear.weight = weight
+        self.loss = nn.CrossEntropyLoss(size_average=False)
+        self.bidirectional = bidirectional
+
+    def criterion(self, sentences, feats):
+
+        sentences, batch_sizes = sentences
+        feats, batch_sizes = feats
+
+        if len(batch_sizes) >= 2:
+            total = sum(batch_sizes)
+            loss = Variable(torch.FloatTensor([0]))
+            # forward language model
+            context_start = 0
+            next_start = batch_sizes[0]
+            for i in range(1, len(batch_sizes)):
+                context = feats[context_start:context_start+batch_sizes[i], 0:self.dim]
+                next = sentences[next_start:next_start+batch_sizes[i]]
+                loss += self.loss(self.linear(context), next)
+                context_start += batch_sizes[i-1]
+                next_start += batch_sizes[i]
+
+
+            if self.bidirectional:
+                # backward language model
+                context_start = total
+                next_start = total - batch_sizes[-1]
+                for i in range(len(batch_sizes) - 2, 0, -1):
+                    context_start -= batch_sizes[i+1]
+                    next_start -= batch_sizes[i]
+                    context = feats[context_start:context_start+batch_sizes[i+1], self.dim:]
+                    next = sentences[next_start:next_start+batch_sizes[i+1]]
+                    loss += self.loss(self.linear(context), next)
+
+            return loss/(total*2-batch_sizes[0]-batch_sizes[-1])
+        else:
+            return Variable(torch.FloatTensor([0]))
 
 class BiLSTMCRF(nn.Module):
     def __init__(self, vocab_size, num_label, embedding_dim, hidden_dim, dropout=0.5):
         super(BiLSTMCRF, self).__init__()
         self.embedding_dim = embedding_dim
         self.hidden_dim = hidden_dim
-        word_embeds = nn.Embedding(vocab_size, embedding_dim)
-        self.input_embed = Embedding(word_embeds, self.embedding_dim)
-        self.lstm = nn.LSTM(embedding_dim, hidden_dim // 2,
+        self.word_embeds = nn.Embedding(vocab_size, embedding_dim)
+        self.input_embed = Embedding(self.word_embeds, self.embedding_dim)
+        self.lstm = nn.LSTM(embedding_dim, embedding_dim,
                             num_layers=1, bidirectional=True, dropout=dropout)
 
-        self.crf = CRFLayer(hidden_dim, num_label)
+        self.crf = CRFLayer(embedding_dim * 2, num_label)
+
+        self.lm = LanguageModel(embedding_dim, vocab_size, self.word_embeds.weight, bidirectional=True)
 
     def _get_features(self, input):
         '''
@@ -280,6 +327,11 @@ class BiLSTMCRF(nn.Module):
         feats = self._get_features(sentence)
         return self.crf.neg_log_likelihood(feats, tags)
 
+    def loss(self, sentence, tags):
+        feats = self._get_features(sentence)
+        return self.crf.neg_log_likelihood(feats, tags), self.lm.criterion(sentence, feats)
+
+
 
 torch.set_num_threads(10)
 
@@ -287,12 +339,13 @@ class Config:
     def __init__(self):
         self.max_vocab_size = 5000
         self.batch_size = 16
-        self.embedding_size = 50
-        self.hidden_size = 50
-        self.dropout = 0.3
+        self.embedding_size = 128
+        self.hidden_size = 128
+        self.dropout = 0.5
         self.use_cuda = False
 
         self.data_root = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/'
+        #self.data_root = '/home/sunqf/Work/chinese_segment/data'
         self.train_paths = [os.path.join(self.data_root, 'train/train.all')]
         self.eval_paths = [os.path.join(self.data_root, 'gold', path)
                            for path in ['bosonnlp/auto_comments.txt', 'bosonnlp/food_comments.txt',
@@ -302,6 +355,8 @@ class Config:
 
         self.model_file = 'model/model'
 
+        self.lm_weight = 0.5
+
 config = Config()
 
 from .loader import DataLoader
@@ -310,15 +365,20 @@ loader = DataLoader(config.train_paths, config.max_vocab_size)
 
 dict, tagger, training_data = loader.get_data(config.train_paths, config.batch_size)
 
+eval_data = list(loader.batch(config.eval_paths, config.batch_size))
+
 import random
 random.shuffle(training_data)
 
 model = BiLSTMCRF(len(dict), len(tagger), config.embedding_size, config.hidden_size, config.dropout)
 if config.use_cuda:
     model = model.cuda()
-    for sentences, batch_tags in training_data:
-        sentences.data = sentences.data.cuda()
-        batch_tags.data = batch_tags.data.cuda()
+    training_data = [(PackedSequence(sentences.data.cuda(), sentences.batch_sizes),
+                      PackedSequence(batch_tags.data.cuda(), batch_tags.batch_sizes))
+                     for sentences, batch_tags in training_data]
+    eval_data = [(PackedSequence(sentences.data.cuda(), sentences.batch_sizes),
+                  PackedSequence(batch_tags.data.cuda(), batch_tags.batch_sizes))
+                 for sentences, batch_tags in eval_data]
 
 #optimizer = torch.optim.SGD(model.parameters(), lr=0.01, weight_decay=1e-4)
 
@@ -326,7 +386,7 @@ optimizer = torch.optim.Adam(model.parameters())
 
 
 
-eval_data = list(loader.batch(config.eval_paths, config.batch_size))
+
 
 
 def unpack(pad_sequence):
@@ -374,7 +434,6 @@ def evaluation(model, data):
             true += t
             pos += p
 
-    print('pos %d  true %d' % (pos, true))
     prec = correct/float(pos)
     recall = correct/float(true)
     return prec, recall, 2*prec*recall/(prec+recall)
@@ -385,7 +444,9 @@ def evaluation(model, data):
 
 # Make sure prepare_sequence from earlier in the LSTM section is loaded
 for epoch in range(10):  # again, normally you would NOT do 300 epochs, it is toy data
-    loss = 0
+    crf_loss = 0
+    lm_loss = 0
+    total_loss = 0
 
     import time
     start_time = time.time()
@@ -397,16 +458,22 @@ for epoch in range(10):  # again, normally you would NOT do 300 epochs, it is to
         model.zero_grad()
 
         # Step 2. Run our forward pass.
-        nll = model.neg_log_likelihood(batch_sentence, batch_tags)
+        batch_crf_loss, batch_lm_loss = model.loss(batch_sentence, batch_tags)
 
-        loss += nll.data[0]
+
+        batch_loss = batch_crf_loss + batch_lm_loss * config.lm_weight
+
+        crf_loss += batch_crf_loss.data[0]
+        lm_loss += batch_lm_loss.data[0]
+        total_loss += batch_loss.data[0]
+
         # Step 3. Compute the loss, gradients, and update the parameters by
         # calling optimizer.step()
-        nll.backward()
+        batch_loss.backward()
         torch.nn.utils.clip_grad_norm(model.parameters(), 0.25)
         optimizer.step()
 
-        if index % 100 == 0:
+        if index % 500 == 0:
 
             model.eval()
             # sample
@@ -419,8 +486,17 @@ for epoch in range(10):  # again, normally you would NOT do 300 epochs, it is to
                                for word, ix in zip(list(sentence.data), list(tag_ixs))])
                 print('dst: %s' % seg)
 
-            print('loss: %f, speed: %f' % (loss / (config.batch_size * 100), (time.time() - start_time) / (config.batch_size * 100)))
-            loss = 0
+            print('crf loss',crf_loss)
+            print('lm loss',lm_loss)
+            print('total loss', total_loss)
+            print('total loss: %f, crf loss: %f, lm loss: %f, speed: %f' %
+                  (total_loss / (config.batch_size * 500),
+                   (crf_loss / (config.batch_size * 500)),
+                   math.exp(lm_loss / (config.batch_size * 500)),
+                   (time.time() - start_time) / (config.batch_size * 500)))
+            crf_loss = 0
+            lm_loss = 0
+            total_loss = 0
             start_time = time.time()
 
             # evaluation
