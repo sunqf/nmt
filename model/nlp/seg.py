@@ -145,10 +145,11 @@ class Embedding(nn.Module):
 
 
 class CRFLayer(nn.Module):
-    def __init__(self, feature_dim, num_labels):
+    def __init__(self, feature_dim, num_labels, dropout=0.5):
         super(CRFLayer, self).__init__()
         self.hidden_dim = feature_dim
         self.num_labels = num_labels
+        self.feature_dropout = nn.Dropout(dropout)
         self.feature2labels = nn.Linear(feature_dim, num_labels)
         self.start_transition = nn.Parameter(torch.randn(self.num_labels))
         # tags[i + 1] -> tags[i]
@@ -236,7 +237,9 @@ class CRFLayer(nn.Module):
         :param tags: PackedSequence
         :return:
         '''
-        emissions = PackedSequence(self.feature2labels(feats.data), feats.batch_sizes)
+        feats, batch_sizes = feats
+        #feats = self.feature_dropout(feats)
+        emissions = PackedSequence(self.feature2labels(feats), batch_sizes)
         forward_score = self._forward_alg(emissions)
         gold_score = self._score_sentence(emissions, tags)
         return (forward_score - gold_score).sum()
@@ -244,39 +247,53 @@ class CRFLayer(nn.Module):
     def forward(self, feats):
         '''
         unsupported batch process
-        :param feats: [seqence length, feature size]
+        :param feats: PackedSequence
         :return: score, tag sequence
         '''
         # Find the best path, given the features.
-        emissions = self.feature2labels(feats)
-        score, tag_seq = self._viterbi_decode(emissions)
-        return score, tag_seq
+        feats, batch_sizes = feats
+        #feats = self.feature_dropout(feats)
+        emissions = PackedSequence(self.feature2labels(feats), batch_sizes)
+        sentences, lens = pad_packed_sequence(emissions, batch_first=True)
+        return [self._viterbi_decode(sentence[:len]) for sentence, len in zip(sentences, lens)]
 
 class LanguageModel(nn.Module):
 
-    def __init__(self, dim, num_vocab, weight, bidirectional=True):
+    def __init__(self, dim, num_vocab, shared_weight, bidirectional=True, dropout=0.5):
         super(LanguageModel, self).__init__()
         self.dim = dim
-        self.linear = nn.Linear(dim, num_vocab)
-        self.linear.weight = weight
-        self.loss = nn.CrossEntropyLoss(size_average=False)
         self.bidirectional = bidirectional
+        self.hidden_dropout = nn.Dropout(dropout)
+        self.forward_linear = nn.Linear(dim, num_vocab)
+        self.forward_linear.weight = shared_weight
 
-    def criterion(self, sentences, feats):
+
+        if self.bidirectional:
+            self.backward_linear = nn.Linear(dim, num_vocab)
+            self.backward_linear.weight = shared_weight
+        self.cross_entropy = nn.CrossEntropyLoss(size_average=False)
+
+
+    def criterion(self, sentences, hidden_states):
 
         sentences, batch_sizes = sentences
-        feats, batch_sizes = feats
+        hidden_states, batch_sizes = hidden_states
+        #hidden_states = self.hidden_dropout(hidden_states)
+
+        loss = Variable(torch.FloatTensor([0]))
+        if self.forward_linear.weight.is_cuda:
+            loss = loss.cuda()
 
         if len(batch_sizes) >= 2:
             total = sum(batch_sizes)
-            loss = Variable(torch.FloatTensor([0]))
+
             # forward language model
             context_start = 0
             next_start = batch_sizes[0]
             for i in range(1, len(batch_sizes)):
-                context = feats[context_start:context_start+batch_sizes[i], 0:self.dim]
+                context = hidden_states[context_start:context_start + batch_sizes[i], 0:self.dim]
                 next = sentences[next_start:next_start+batch_sizes[i]]
-                loss += self.loss(self.linear(context), next)
+                loss += self.cross_entropy(self.forward_linear(context), next)
                 context_start += batch_sizes[i-1]
                 next_start += batch_sizes[i]
 
@@ -288,40 +305,50 @@ class LanguageModel(nn.Module):
                 for i in range(len(batch_sizes) - 2, 0, -1):
                     context_start -= batch_sizes[i+1]
                     next_start -= batch_sizes[i]
-                    context = feats[context_start:context_start+batch_sizes[i+1], self.dim:]
+                    context = hidden_states[context_start:context_start + batch_sizes[i+1], self.dim:]
                     next = sentences[next_start:next_start+batch_sizes[i+1]]
-                    loss += self.loss(self.linear(context), next)
+                    loss += self.cross_entropy(self.backward_linear(context), next)
 
             return loss/(total*2-batch_sizes[0]-batch_sizes[-1])
         else:
-            return Variable(torch.FloatTensor([0]))
+            return loss
+
 
 class BiLSTMCRF(nn.Module):
-    def __init__(self, vocab_size, num_label, embedding_dim, hidden_dim, dropout=0.5):
+    def __init__(self, vocab_size, num_label, embedding_dim, num_hidden_layer=1, dropout=0.5):
         super(BiLSTMCRF, self).__init__()
         self.embedding_dim = embedding_dim
-        self.hidden_dim = hidden_dim
         self.word_embeds = nn.Embedding(vocab_size, embedding_dim)
         self.input_embed = Embedding(self.word_embeds, self.embedding_dim)
+
+        self.num_hidden_layer = num_hidden_layer
+        self.num_direction = 2
         self.lstm = nn.LSTM(embedding_dim, embedding_dim,
-                            num_layers=1, bidirectional=True, dropout=dropout)
+                            num_layers=num_hidden_layer, bidirectional=True, dropout=dropout)
+        self.init_hidden_state = nn.Parameter(torch.Tensor(self.num_hidden_layer * self.num_direction, self.embedding_dim))
 
+        # output layer
         self.crf = CRFLayer(embedding_dim * 2, num_label)
-
         self.lm = LanguageModel(embedding_dim, vocab_size, self.word_embeds.weight, bidirectional=True)
+
+        self.reset_parameter()
+
+    def reset_parameter(self):
+        nn.init.normal(self.init_hidden_state, 0, 0.5)
 
     def _get_features(self, input):
         '''
-        :param sentence: [seq_len]
+        :param sentence: PackedSequence
         :return: [seq_len, hidden_dim * 2]
         '''
+        _, batch_sizes = input
+        init_hidden_size = self.init_hidden_state.unsqueeze(1).expand(self.num_hidden_layer*self.num_direction, batch_sizes[0], self.embedding_dim)
         embeds = self.input_embed(input)
-        lstm_output, self.hidden = self.lstm(embeds, None)
+        lstm_output, self.hidden = self.lstm(embeds, (init_hidden_size, init_hidden_size))
         return lstm_output
 
     def forward(self, sentences):
-        sentences, lens = pad_packed_sequence(self._get_features(sentences), batch_first=True)
-        return [self.crf(sentence[:len]) for sentence, len in zip(sentences, lens)]
+        return self.crf(self._get_features(sentences))
 
     def neg_log_likelihood(self, sentence, tags):
         feats = self._get_features(sentence)
@@ -341,7 +368,7 @@ class Config:
         self.batch_size = 16
         self.embedding_size = 128
         self.hidden_size = 128
-        self.dropout = 0.5
+        self.dropout = 0.3
         self.use_cuda = False
 
         self.data_root = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/'
@@ -357,6 +384,8 @@ class Config:
 
         self.lm_weight = 0.5
 
+        self.eval_step = 100
+
 config = Config()
 
 from .loader import DataLoader
@@ -369,6 +398,13 @@ eval_data = list(loader.batch(config.eval_paths, config.batch_size))
 
 import random
 random.shuffle(training_data)
+random.shuffle(eval_data)
+
+def bisection(data):
+    random.shuffle(data)
+    return data[:len(data)//2], data[len(data)//2:]
+
+valid_data, eval_data = bisection(eval_data)
 
 model = BiLSTMCRF(len(dict), len(tagger), config.embedding_size, config.hidden_size, config.dropout)
 if config.use_cuda:
@@ -386,12 +422,11 @@ optimizer = torch.optim.Adam(model.parameters())
 
 
 
-
-
-
 def unpack(pad_sequence):
     seqs, lens = pad_packed_sequence(pad_sequence, batch_first=True)
     return [seq[:len] for seq, len in zip(seqs, lens)]
+
+
 
 def evaluation_one(pred, gold):
     count = 0
@@ -428,15 +463,16 @@ def evaluation(model, data):
         pred = model(sentences)
         gold_tags = unpack(gold_tags)
 
+        #print(gold_tags)
         for pred, gold in zip(pred, gold_tags):
             c, t, p = evaluation_one(pred[1], list(gold.data))
             correct += c
             true += t
             pos += p
 
-    prec = correct/float(pos)
-    recall = correct/float(true)
-    return prec, recall, 2*prec*recall/(prec+recall)
+    prec = correct/float(pos+1e-5)
+    recall = correct/float(true+1e-5)
+    return prec, recall, 2*prec*recall/(prec+recall+1e-5)
 
 
 
@@ -447,6 +483,8 @@ for epoch in range(10):  # again, normally you would NOT do 300 epochs, it is to
     crf_loss = 0
     lm_loss = 0
     total_loss = 0
+
+    best_valid_loss = 1e8
 
     import time
     start_time = time.time()
@@ -473,12 +511,48 @@ for epoch in range(10):  # again, normally you would NOT do 300 epochs, it is to
         torch.nn.utils.clip_grad_norm(model.parameters(), 0.25)
         optimizer.step()
 
-        if index % 500 == 0:
+        if index % config.eval_step == 0:
+            print('train: total loss = %f, crf loss = %f, lm loss = %f, lm ppl = %f, speed = %f' %
+                  (total_loss / (config.batch_size * config.eval_step),
+                   (crf_loss / (config.batch_size * config.eval_step)),
+                   lm_loss / config.eval_step,
+                   math.exp(lm_loss / config.eval_step),
+                   (time.time() - start_time) / (config.batch_size * config.eval_step)))
+            crf_loss = 0
+            lm_loss = 0
+            total_loss = 0
 
             model.eval()
-            # sample
-            sentences, gold_tags = training_data[random.randint(0, len(training_data) - 1)]
 
+            # valid
+            valid_crf_loss = 0
+            valid_lm_loss = 0
+            valid_total_loss = 0
+            for sentences, tags in valid_data:
+                batch_valid_crf_loss, batch_valid_lm_loss = model.loss(sentences, tags)
+                valid_crf_loss += batch_valid_crf_loss.data[0]
+                valid_lm_loss += batch_valid_lm_loss.data[0]
+                valid_loss = batch_valid_crf_loss + batch_valid_lm_loss * config.lm_weight
+                valid_total_loss += valid_loss.data[0]
+
+            print('valid: total loss = %f, crf loss = %f, lm loss = %f, lm ppl = %f' %
+                  (valid_total_loss / (config.batch_size * config.eval_step),
+                   (valid_crf_loss / (config.batch_size * config.eval_step)),
+                   valid_lm_loss / (config.eval_step),
+                   math.exp(valid_lm_loss / config.eval_step)))
+
+            if valid_total_loss < best_valid_loss:
+                for group in optimizer.param_groups:
+                    group['lr'] /= 2
+            else:
+                best_valid_loss = valid_total_loss
+
+            # evaluation
+            prec, recall, f_score = evaluation(model, eval_data)
+            print('metrics: eval prec = %f  recall = %f  F-score = %f' % (prec, recall, f_score))
+
+            # sample
+            sentences, gold_tags = valid_data[random.randint(0, len(valid_data) - 1)]
             for sentence, pred in zip(unpack(sentences), model(sentences)):
                 pred_score, tag_ixs = pred
                 print(pred_score)
@@ -486,21 +560,9 @@ for epoch in range(10):  # again, normally you would NOT do 300 epochs, it is to
                                for word, ix in zip(list(sentence.data), list(tag_ixs))])
                 print('dst: %s' % seg)
 
-            print('crf loss',crf_loss)
-            print('lm loss',lm_loss)
-            print('total loss', total_loss)
-            print('total loss: %f, crf loss: %f, lm loss: %f, speed: %f' %
-                  (total_loss / (config.batch_size * 500),
-                   (crf_loss / (config.batch_size * 500)),
-                   math.exp(lm_loss / (config.batch_size * 500)),
-                   (time.time() - start_time) / (config.batch_size * 500)))
-            crf_loss = 0
-            lm_loss = 0
-            total_loss = 0
-            start_time = time.time()
 
-            # evaluation
-            print('eval prec: %f  recall: %f  F-score: %f' % evaluation(model, eval_data))
+
+            start_time = time.time()
 
     with open('%s.%d' % (config.model_file, epoch), 'wb') as f:
         torch.save(model, f)
