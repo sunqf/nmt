@@ -181,11 +181,10 @@ class DataLoader:
         return self.tagger
 
     def batch(self, paths, batch_size):
-        data = list(self.load(paths))[0:10000]
-        data = sorted(data, key=lambda item: len(item[0]), reverse=True)
+        data = list(self.load(paths))
 
         for start in range(0, len(data), batch_size):
-            batch = data[start: start + batch_size]
+            batch = sorted(data[start: start + batch_size], key=lambda item: len(item[0]), reverse=True)
 
             lens = [len(sen) for sen, tags in batch]
             max_len = lens[0]
