@@ -4,102 +4,10 @@ import math
 import itertools
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence, PackedSequence
 from torch.autograd import Variable
-
-paths = ['/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/train/train.all']
-'''
-def split_to_single(text):
-    for word in text.split():
-        for ch in word:
-            yield(ch)
-
-def count_word(corpus_paths):
-
-    word_counts = collections.defaultdict(int)
-
-    for path in corpus_paths:
-        assert os.path.exists(path)
-        with open(path, 'r') as file:
-            for line in file:
-                for word in split_to_single(line):
-                    word_counts[word] += 1
-    return word_counts
-
-
-class Dict(object):
-    def __init__(self, words):
-        self.words = words
-
-        self.words.insert(0, 'padding')
-        self.words.insert(1, 'unk')
-        self.words.insert(2, 'eos')
-        self.padding_idx = 0
-        self.unk_idx = 1
-        self.eos = 2
-        self.word2ids = {word: id for id, word in enumerate(self.words)}
-
-    def getPaddingIdx(self):
-        return self.padding_idx
-
-    def getUnkIdx(self):
-        return self.unk_idx
-
-    def vocabSize(self):
-        return len(self.words)
-
-    def getId(self, word):
-        return self.word2ids.get(word, self.unk_idx)
-
-    def ids(self, words):
-        return [self.word2ids.get(word, self.unk_idx) for word in words]
-
-    @staticmethod
-    def build(word_counts, vocab_size):
-        if len(word_counts) > vocab_size:
-            word_counts = sorted(word_counts.items(), key=lambda item: item[1], reverse=True)[:vocab_size]
-
-        return Dict(list([word for word, count in word_counts]))
-
-
-
-
-word_counts = count_word(paths)
-
-with open("word-counts.txt", 'w') as file:
-    for k, v in sorted(word_counts.items(), key=lambda items: items[1], reverse=True):
-        file.write('%s\t%d\n' % (k, v))
-
-
-dict = Dict.build(word_counts, vocab_size=5000)
-
-def tag(pos, seq_len):
-    if pos == 0:
-        return 'B'
-    elif pos == seq_len - 1:
-        return 'E'
-    else:
-        return 'I'
-
-def load(corpus_paths):
-    for path in corpus_paths:
-        assert os.path.exists(path)
-        with open(path, 'r') as file:
-            for line in file:
-                if len(line.strip()) > 0:
-                    chars = [ch for word in line.split() for ch in word]
-                    tags = [tag(pos, len(word)) for word in line.split() for pos in range(len(word))]
-                    assert(len(chars) == len(tags))
-                    yield chars, tags
-
-
-training_data = list(load(paths, dict))
-import random
-random.shuffle(training_data)
-'''
+from sklearn.model_selection import train_test_split
 
 import torch
-import torch.autograd as autograd
 import torch.nn as nn
-import torch.optim as optim
 
 def log_sum_exp(vecs, axis):
     max_val, _ = vecs.max(axis)
@@ -141,8 +49,6 @@ class Embedding(nn.Module):
             emb = self.activation(self.linear(torch.cat(emb + feats, -1)))
 
         return PackedSequence(emb, batch_sizes)
-
-
 
 class CRFLayer(nn.Module):
     def __init__(self, feature_dim, num_labels, dropout=0.5):
@@ -315,26 +221,30 @@ class LanguageModel(nn.Module):
 
 
 class BiLSTMCRF(nn.Module):
-    def __init__(self, vocab_size, num_label, embedding_dim, num_hidden_layer=1, dropout=0.5):
+    def __init__(self, vocab_size, num_label, embedding_dim, hidden_mode, num_hidden_layer=1, dropout=0.5):
         super(BiLSTMCRF, self).__init__()
         self.embedding_dim = embedding_dim
         self.word_embeds = nn.Embedding(vocab_size, embedding_dim)
         self.input_embed = Embedding(self.word_embeds, self.embedding_dim)
 
+        self.hidden_dim = self.embedding_dim
         self.num_hidden_layer = num_hidden_layer
         self.num_direction = 2
-        self.lstm = nn.LSTM(embedding_dim, embedding_dim,
-                            num_layers=num_hidden_layer, bidirectional=True, dropout=dropout)
-        self.init_hidden_state = nn.Parameter(torch.Tensor(self.num_hidden_layer * self.num_direction, self.embedding_dim))
+
+        self.hidden_mode = hidden_mode
+
+        if self.hidden_mode == 'QRNN':
+            from .qrnn import QRNN
+            self.hidden_module = QRNN(self.embedding_dim, self.hidden_dim, self.num_hidden_layer,
+                                      kernel_size=5, dropout = config.dropout)
+        else:
+            self.hidden_module = nn.LSTM(self.embedding_dim, self.hidden_dim, num_layers=self.num_hidden_layer,
+                                         bidirectional=True, dropout=dropout)
 
         # output layer
         self.crf = CRFLayer(embedding_dim * 2, num_label)
         self.lm = LanguageModel(embedding_dim, vocab_size, self.word_embeds.weight, bidirectional=True)
 
-        self.reset_parameter()
-
-    def reset_parameter(self):
-        nn.init.normal(self.init_hidden_state, 0, 0.5)
 
     def _get_features(self, input):
         '''
@@ -342,9 +252,8 @@ class BiLSTMCRF(nn.Module):
         :return: [seq_len, hidden_dim * 2]
         '''
         _, batch_sizes = input
-        init_hidden_size = self.init_hidden_state.unsqueeze(1).expand(self.num_hidden_layer*self.num_direction, batch_sizes[0], self.embedding_dim)
         embeds = self.input_embed(input)
-        lstm_output, self.hidden = self.lstm(embeds, (init_hidden_size, init_hidden_size))
+        lstm_output, _ = self.hidden_module(embeds)
         return lstm_output
 
     def forward(self, sentences):
@@ -367,7 +276,8 @@ class Config:
         self.max_vocab_size = 5000
         self.batch_size = 16
         self.embedding_size = 128
-        self.hidden_size = 128
+        self.hidden_mode = 'QRNN'
+        self.num_hidden_layer = 2
         self.dropout = 0.3
         self.use_cuda = False
 
@@ -386,27 +296,31 @@ class Config:
 
         self.eval_step = 100
 
+
 config = Config()
 
 from .loader import DataLoader
 
 loader = DataLoader(config.train_paths, config.max_vocab_size)
 
-dict, tagger, training_data = loader.get_data(config.train_paths, config.batch_size)
+vocab, tagger, training_data = loader.get_data(config.train_paths, config.batch_size)
 
-eval_data = list(loader.batch(config.eval_paths, config.batch_size))
+eval_data = list(loader.batch(config.eval_paths, config.batch_size))[0:500]
 
 import random
 random.shuffle(training_data)
 random.shuffle(eval_data)
 
-def bisection(data):
+def split(data, scale):
     random.shuffle(data)
-    return data[:len(data)//2], data[len(data)//2:]
+    pos = math.floor(len(data) * scale)
+    return data[:pos], data[pos:]
 
-valid_data, eval_data = bisection(eval_data)
+valid_data, eval_data = train_test_split(eval_data, test_size=0.7)
 
-model = BiLSTMCRF(len(dict), len(tagger), config.embedding_size, config.hidden_size, config.dropout)
+model = BiLSTMCRF(len(vocab), len(tagger), config.embedding_size,
+                  config.hidden_mode, config.num_hidden_layer, config.dropout)
+
 if config.use_cuda:
     model = model.cuda()
     training_data = [(PackedSequence(sentences.data.cuda(), sentences.batch_sizes),
@@ -547,22 +461,21 @@ for epoch in range(10):  # again, normally you would NOT do 300 epochs, it is to
             else:
                 best_valid_loss = valid_total_loss
 
-            # evaluation
-            prec, recall, f_score = evaluation(model, eval_data)
-            print('metrics: eval prec = %f  recall = %f  F-score = %f' % (prec, recall, f_score))
-
             # sample
             sentences, gold_tags = valid_data[random.randint(0, len(valid_data) - 1)]
             for sentence, pred in zip(unpack(sentences), model(sentences)):
                 pred_score, tag_ixs = pred
                 print(pred_score)
-                seg = ''.join([dict.get_word(word) + ' ' if tagger.is_split(ix) else dict.get_word(word)
+                seg = ''.join([vocab.get_word(word) + ' ' if tagger.is_split(ix) else vocab.get_word(word)
                                for word, ix in zip(list(sentence.data), list(tag_ixs))])
                 print('dst: %s' % seg)
-
-
-
             start_time = time.time()
+
+
+    # evaluation
+    prec, recall, f_score = evaluation(model, eval_data)
+    print('metrics: eval prec = %f  recall = %f  F-score = %f' % (prec, recall, f_score))
+
 
     with open('%s.%d' % (config.model_file, epoch), 'wb') as f:
         torch.save(model, f)
