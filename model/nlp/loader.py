@@ -6,28 +6,7 @@ import torch
 from torch.autograd import Variable
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence, PackedSequence
 
-
-paths = ['/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/train/train.all']
-
-
-FH_NUM = FHN = (
- (u"０", u"0"), (u"１", u"1"), (u"２", u"2"), (u"３", u"3"), (u"４", u"4"),
- (u"５", u"5"), (u"６", u"6"), (u"７", u"7"), (u"８", u"8"), (u"９", u"9"),
-)
-FH_ALPHA = FHA = (
- (u"ａ", u"a"), (u"ｂ", u"b"), (u"ｃ", u"c"), (u"ｄ", u"d"), (u"ｅ", u"e"),
- (u"ｆ", u"f"), (u"ｇ", u"g"), (u"ｈ", u"h"), (u"ｉ", u"i"), (u"ｊ", u"j"),
- (u"ｋ", u"k"), (u"ｌ", u"l"), (u"ｍ", u"m"), (u"ｎ", u"n"), (u"ｏ", u"o"),
- (u"ｐ", u"p"), (u"ｑ", u"q"), (u"ｒ", u"r"), (u"ｓ", u"s"), (u"ｔ", u"t"),
- (u"ｕ", u"u"), (u"ｖ", u"v"), (u"ｗ", u"w"), (u"ｘ", u"x"), (u"ｙ", u"y"), (u"ｚ", u"z"),
- (u"Ａ", u"A"), (u"Ｂ", u"B"), (u"Ｃ", u"C"), (u"Ｄ", u"D"), (u"Ｅ", u"E"),
- (u"Ｆ", u"F"), (u"Ｇ", u"G"), (u"Ｈ", u"H"), (u"Ｉ", u"I"), (u"Ｊ", u"J"),
- (u"Ｋ", u"K"), (u"Ｌ", u"L"), (u"Ｍ", u"M"), (u"Ｎ", u"N"), (u"Ｏ", u"O"),
- (u"Ｐ", u"P"), (u"Ｑ", u"Q"), (u"Ｒ", u"R"), (u"Ｓ", u"S"), (u"Ｔ", u"T"),
- (u"Ｕ", u"U"), (u"Ｖ", u"V"), (u"Ｗ", u"W"), (u"Ｘ", u"X"), (u"Ｙ", u"Y"), (u"Ｚ", u"Z"),
-)
-
-class Dict(object):
+class Vocab(object):
     def __init__(self, words):
         self.words = words
 
@@ -65,8 +44,62 @@ class Dict(object):
         if len(word_counts) > vocab_size:
             word_counts = sorted(word_counts.items(), key=lambda item: item[1], reverse=True)[:vocab_size]
 
-        return Dict(list([word for word, count in word_counts]))
+        return Vocab(list([word for word, count in word_counts]))
 
+# 姓名字典
+class FamilyName:
+    def __init__(self, family_dict):
+        super(FamilyName, self).__init__()
+
+        self.dict = family_dict
+        self.max_len = max(self.dict, key=lambda word: len(word))
+
+        self.SINGLE_WORD = 0
+        self.DOUBLE_WORD_1 = 1
+        self.DOUBLE_WORD_2 = 2
+        self.NO_FAMILY = 3
+
+    def convert(self, sequence):
+        def split(sequence):
+            start = 0
+            seq_len = len(sequence)
+            while (start < seq_len):
+                found = False
+                for l in range(min(self.max_len, seq_len - start), 0, step=-1):
+                    if sequence[start:start+l] in self.dict:
+                        if l == 1:
+                            yield [self.SINGLE_WORD]
+                        elif l == 2:
+                            yield [self.DOUBLE_WORD_1, self.DOUBLE_WORD_2]
+
+                        start += l
+                        found = True
+                        break
+
+                if found is False:
+                    yield [self.NO_FAMILY]
+                    start += 1
+
+        return chain.from_iterable(split(sequence))
+
+
+# 单字属性字典
+class CharacterAttribute:
+
+    def __init__(self, attributes):
+        super(CharacterAttribute, self).__init__()
+
+        self.attributes = attributes
+
+    def convert(self, sequence):
+        return [self.attributes.get(w) for w in sequence]
+
+
+
+class Gazetteers:
+
+    def __init__(self):
+        pass
 
 START_TAG = "start"
 END_TAG = "end"
@@ -132,9 +165,8 @@ class DataLoader:
     def __init__(self, corpus_paths, vocab_size=5000):
         self.corpus_paths = corpus_paths
         self.vocab_size = vocab_size
-        self.dict = self._build_dict(corpus_paths)
+        self.vocab = self._build_vocab(corpus_paths)
         self.tagger = BMESTagger()
-
 
         #print('\n'.join('%d: %d' % (size, len(coll)) for size, coll in self.buckets))
 
@@ -157,9 +189,9 @@ class DataLoader:
 
         return word_counts
 
-    def _build_dict(self, corpus_paths):
+    def _build_vocab(self, corpus_paths):
         word_counts = self._count_word(corpus_paths)
-        return Dict.build(word_counts, self.vocab_size)
+        return Vocab.build(word_counts, self.vocab_size)
 
     def load(self, corpus_paths):
         for path in corpus_paths:
@@ -174,14 +206,14 @@ class DataLoader:
                         yield chars, tags
 
 
-    def get_dict(self):
-        return self.dict
+    def get_vocab(self):
+        return self.vocab
 
     def get_tagger(self):
         return self.tagger
 
     def batch(self, paths, batch_size):
-        data = list(self.load(paths))[0:10000]
+        data = list(self.load(paths))[0:30000]
         data = sorted(data, key=lambda item: len(item[0]), reverse=True)
 
         for start in range(0, len(data), batch_size):
@@ -194,12 +226,12 @@ class DataLoader:
 
             for i, (sen, tags) in enumerate(batch):
                 for pos in range(0, lens[i]):
-                    batch_sen[pos, i] = self.dict.getId(sen[pos])
+                    batch_sen[pos, i] = self.vocab.getId(sen[pos])
                     batch_tags[pos, i] = self.tagger.getId(tags[pos])
             yield (pack_padded_sequence(Variable(batch_sen), lens), pack_padded_sequence(Variable(batch_tags), lens))
 
 
     def get_data(self, paths, batch_size):
-        return self.dict, self.tagger, list(self.batch(paths, batch_size))
+        return self.vocab, self.tagger, list(self.batch(paths, batch_size))
 
 
