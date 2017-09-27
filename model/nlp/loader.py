@@ -161,6 +161,43 @@ class BMESTagger:
     def is_split(self, id):
         return id == 3 or id == 0
 
+
+def strQ2B(ustring):
+    """全角转半角"""
+    rstring = ""
+    for uchar in ustring:
+        inside_code = ord(uchar)
+        if inside_code == 12288:  # 全角空格直接转换
+            inside_code = 32
+        elif (inside_code >= 65281 and inside_code <= 65374):  # 全角字符（除空格）根据关系转化
+            inside_code -= 65248
+            rstring += chr(inside_code)
+        else:
+            rstring += uchar
+    return rstring
+
+import re
+isnumeric = re.compile('^[-+]?([0-9]+(\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+)?$')
+iseng = re.compile('^[A-Za-z][A-Za-z-\.]*$')
+isemail = re.compile('^[a-z0-9!#$%&\'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&\'*+/=?^_`{|}~-]+)*@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$', re.IGNORECASE)
+isurl = re.compile(
+                   r'^(?:http|ftp)s?://' # http:// or https://
+                   r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|' #domain...
+                   r'localhost|' #localhost...
+                   r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})' # ...or ip
+                   r'(?::\d+)?' # optional port
+                   r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+
+def tokenize(word):
+    if isnumeric.fullmatch(word) is not None:
+        return ['@numeric']
+    elif iseng.fullmatch(word) is not None:
+        return ['@english']
+    elif isemail.fullmatch(word) is not None or isurl.fullmatch(word) is not None:
+        return ['@url_email']
+    else:
+        return list(word)
+
 class DataLoader:
     def __init__(self, corpus_paths, vocab_size=5000):
         self.corpus_paths = corpus_paths
@@ -183,8 +220,9 @@ class DataLoader:
             assert os.path.exists(path)
             with open(path, 'r') as file:
                 for line in file:
+                    line = strQ2B(line)
                     for word in line.split():
-                        for ch in word:
+                        for ch in tokenize(word):
                             word_counts[ch] += 1
 
         return word_counts
@@ -200,8 +238,9 @@ class DataLoader:
             with open(path, 'r') as file:
                 for line in file:
                     if len(line.strip()) > 0:
-                        chars = [ch for word in line.split() for ch in word]
-                        tags = list(chain.from_iterable([self.tagger.tag(word) for word in line.split()]))
+                        line = strQ2B(line)
+                        chars = [ch for word in line.split() for ch in tokenize(word)]
+                        tags = list(chain.from_iterable([self.tagger.tag(tokenize(word)) for word in line.split()]))
                         assert (len(chars) == len(tags))
                         yield chars, tags
 
@@ -213,7 +252,7 @@ class DataLoader:
         return self.tagger
 
     def batch(self, paths, batch_size):
-        data = list(self.load(paths))[0:30000]
+        data = list(self.load(paths))
         data = sorted(data, key=lambda item: len(item[0]), reverse=True)
 
         for start in range(0, len(data), batch_size):
