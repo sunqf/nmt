@@ -325,7 +325,7 @@ loader = DataLoader(config.train_paths, config.char_attr, config.wordset, config
 
 vocab, gazetteers, tagger, training_data = loader.get_data(config.train_paths, config.batch_size)
 
-eval_data = list(loader.batch(config.eval_paths, config.batch_size))[0:500]
+eval_data = list(loader.batch(config.eval_paths, config.batch_size))
 
 import random
 random.shuffle(training_data)
@@ -351,6 +351,7 @@ if config.use_cuda:
                   PackedSequence(batch_tags.data.cuda(), batch_tags.batch_sizes))
                  for sentences, gazetteers, batch_tags in eval_data]
 
+print(model)
 
 #optimizer = torch.optim.SGD(model.parameters(), lr=0.01, weight_decay=1e-4)
 

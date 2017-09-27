@@ -214,22 +214,19 @@ def strQ2B(ustring):
             rstring += chr(inside_code)
         else:
             rstring += uchar
-
     return rstring
 
 import re
-isnumeric = re.compile('^[-+]?([0-9]+(\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+\b)?$')
+isnumeric = re.compile('^[-+]?([0-9]+(\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+)?$')
 iseng = re.compile('^[A-Za-z][A-Za-z-\.]*$')
 isemail = re.compile('^[a-z0-9!#$%&\'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&\'*+/=?^_`{|}~-]+)*@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$', re.IGNORECASE)
-
 isurl = re.compile(
-        r'^(?:http|ftp)s?://' # http:// or https://
-        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|' #domain...
-        r'localhost|' #localhost...
-        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})' # ...or ip
-        r'(?::\d+)?' # optional port
-        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
-
+                   r'^(?:http|ftp)s?://' # http:// or https://
+                   r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|' #domain...
+                   r'localhost|' #localhost...
+                   r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})' # ...or ip
+                   r'(?::\d+)?' # optional port
+                   r'(?:/?|[/?]\S+)$', re.IGNORECASE)
 
 def tokenize(word):
     if isnumeric.fullmatch(word) is not None:
@@ -238,8 +235,8 @@ def tokenize(word):
         return ['@english']
     elif isemail.fullmatch(word) is not None or isurl.fullmatch(word) is not None:
         return ['@url_email']
-    return list(word)
-
+    else:
+        return list(word)
 
 class DataLoader:
     def __init__(self, corpus_paths, char_attr_path, name2path, vocab_size=5000):
@@ -289,7 +286,8 @@ class DataLoader:
                     if len(line.strip()) > 0:
                         line = strQ2B(line)
                         chars = [ch for word in line.split() for ch in tokenize(word)]
-                        tags = list(chain.from_iterable([self.tagger.tag(tokenize(word)) for word in line.split()]))
+                        tags = list(chain.from_iterable(
+                            [self.tagger.tag(tokenize(word)) for word in line.split()]))
                         assert (len(chars) == len(tags))
                         yield chars, tags
 
@@ -304,7 +302,7 @@ class DataLoader:
         return self.dim
 
     def batch(self, paths, batch_size):
-        data = list(self.load(paths))[0:100]
+        data = list(self.load(paths))[0:10000]
         data = sorted(data, key=lambda item: len(item[0]), reverse=True)
 
         for start in range(0, len(data), batch_size):
