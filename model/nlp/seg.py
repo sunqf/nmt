@@ -20,37 +20,42 @@ def log_sum_exp(vecs, axis):
 
 class Embedding(nn.Module):
 
-    def __init__(self, word_embedding, emb_dim, feature_dict=None):
+    def __init__(self, word_embedding, embedding_dim, gazetteers=None):
         super(Embedding, self).__init__()
 
         self.word_embedding = word_embedding
-        if feature_dict is not None:
-            self.feature_dict = feature_dict
-            self.feature_embeddings = [nn.Embedding(num_emb, emb_dim, padding_idx=0)
-                                       for feature_name, num_emb, emb_dim in feature_dict]
-
-            self.activation = nn.ReLU()
-            self.linear = nn.Linear(self.emb_dim + sum([emb_dim for _, _, emb_dim in feature_dict]), emb_dim)
+        self.embedding_dim = embedding_dim
 
 
-    def forward(self, input):
+        if gazetteers is not None:
+            self.gazetteers = gazetteers
+            self.gazetteers_embeddings = [nn.Linear(gazetteer.length(), embedding_dim)
+                               for gazetteer in gazetteers]
+            self.gazetteers_len = [gazetteer.length() for gazetteer in gazetteers]
+
+            self.gazetteers_index = [0] + list(itertools.accumulate(self.gazetteers_len))[0:-1]
+
+    def forward(self, sentence, gazetteers):
         '''
         :param input: PackedSequence
         :return:
         '''
-        input, batch_sizes = input
+        sentence, batch_sizes = sentence
 
-        if input.dim() == 3:
-            emb = self.word_embedding(input[:, :, 0])
-        else:
-            emb = self.word_embedding(input)
+        word_emb = self.word_embedding(sentence)
 
-        if hasattr(self, 'feature_dict'):
-            feats = [feature_embedding(input[:, :, i+1]) for i, feature_embedding in enumerate(self.feature_dict)]
+        if gazetteers is not None and len(self.gazetteers) > 0:
+            gazetteers, batch_sizes = gazetteers
 
-            emb = self.activation(self.linear(torch.cat(emb + feats, -1)))
+            outputs = [embedding(gazetteers[:, start:start+length]).unsqueeze(-1)
+                       for embedding, (start, length) in zip(self.gazetteers_embeddings,
+                                                             zip(self.gazetteers_index, self.gazetteers_len))]
 
-        return PackedSequence(emb, batch_sizes)
+        output = word_emb + torch.cat(outputs, -1).sum(-1)
+
+        return PackedSequence(output, batch_sizes)
+
+
 
 class CRFLayer(nn.Module):
     def __init__(self, feature_dim, num_labels, dropout=0.5):
@@ -231,11 +236,11 @@ class LanguageModel(nn.Module):
 
 
 class BiLSTMCRF(nn.Module):
-    def __init__(self, vocab_size, num_label, embedding_dim, hidden_mode, num_hidden_layer=1, dropout=0.5):
+    def __init__(self, vocab_size, num_label, gazetteers, embedding_dim, hidden_mode, num_hidden_layer=1, dropout=0.5):
         super(BiLSTMCRF, self).__init__()
         self.embedding_dim = embedding_dim
         self.word_embeds = nn.Embedding(vocab_size, embedding_dim)
-        self.input_embed = Embedding(self.word_embeds, self.embedding_dim)
+        self.input_embed = Embedding(self.word_embeds, self.embedding_dim, gazetteers)
 
         self.hidden_dim = self.embedding_dim
         self.num_hidden_layer = num_hidden_layer
@@ -256,26 +261,26 @@ class BiLSTMCRF(nn.Module):
         self.lm = LanguageModel(embedding_dim, vocab_size, self.word_embeds.weight, bidirectional=True, dropout=dropout)
 
 
-    def _get_features(self, input):
+    def _get_features(self, input, gazetteers):
         '''
         :param sentence: PackedSequence
         :return: [seq_len, hidden_dim * 2]
         '''
         _, batch_sizes = input
 
-        embeds = self.input_embed(input)
+        embeds = self.input_embed(input, gazetteers)
         lstm_output, _ = self.hidden_module(embeds)
         return lstm_output
 
-    def forward(self, sentences):
-        return self.crf(self._get_features(sentences))
+    def forward(self, sentences, gazetteers):
+        return self.crf(self._get_features(sentences, gazetteers))
 
     def neg_log_likelihood(self, sentence, tags):
         feats = self._get_features(sentence)
         return self.crf.neg_log_likelihood(feats, tags)
 
-    def loss(self, sentence, tags):
-        feats = self._get_features(sentence)
+    def loss(self, sentence, gazetteers, tags):
+        feats = self._get_features(sentence, gazetteers)
         return self.crf.neg_log_likelihood(feats, tags), self.lm.criterion(sentence, feats)
 
 
@@ -290,7 +295,7 @@ class Config:
         self.hidden_mode = 'QRNN'
         self.num_hidden_layer = 2
         self.dropout = 0.3
-        self.use_cuda = True
+        self.use_cuda = False
 
         self.data_root = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/'
         #self.data_root = '/home/sunqf/Work/chinese_segment/data'
@@ -301,6 +306,10 @@ class Config:
                                         'ctb.gold', 'msr_test_gold.utf8',
                                         'pku_test_gold.utf8']]
 
+        # 字属性字典
+        self.char_attr = './dict/word-type'
+        # 词集合
+        self.wordset = {}
         self.model_file = 'model/model'
 
         self.lm_weight = 0.5
@@ -312,9 +321,9 @@ config = Config()
 
 from .loader import DataLoader
 
-loader = DataLoader(config.train_paths, config.max_vocab_size)
+loader = DataLoader(config.train_paths, config.char_attr, config.wordset, config.max_vocab_size)
 
-vocab, tagger, training_data = loader.get_data(config.train_paths, config.batch_size)
+vocab, gazetteers, tagger, training_data = loader.get_data(config.train_paths, config.batch_size)
 
 eval_data = list(loader.batch(config.eval_paths, config.batch_size))[0:500]
 
@@ -324,20 +333,23 @@ random.shuffle(eval_data)
 
 valid_data, eval_data = train_test_split(eval_data, test_size=0.7)
 
-model = BiLSTMCRF(len(vocab), len(tagger), config.embedding_size,
+model = BiLSTMCRF(len(vocab), len(tagger), gazetteers, config.embedding_size,
                   config.hidden_mode, config.num_hidden_layer, config.dropout)
 
 if config.use_cuda:
     model = model.cuda()
     training_data = [(PackedSequence(sentences.data.cuda(), sentences.batch_sizes),
+                      PackedSequence(gazetteers.data.cuda(), gazetteers.batch_sizes),
                       PackedSequence(batch_tags.data.cuda(), batch_tags.batch_sizes))
-                     for sentences, batch_tags in training_data]
+                     for sentences, gazetteers, batch_tags in training_data]
     valid_data = [(PackedSequence(sentences.data.cuda(), sentences.batch_sizes),
-                  PackedSequence(batch_tags.data.cuda(), batch_tags.batch_sizes))
-                 for sentences, batch_tags in valid_data]
+                   PackedSequence(gazetteers.data.cuda(), gazetteers.batch_sizes),
+                   PackedSequence(batch_tags.data.cuda(), batch_tags.batch_sizes))
+                  for sentences, gazetteers, batch_tags in valid_data]
     eval_data = [(PackedSequence(sentences.data.cuda(), sentences.batch_sizes),
+                  PackedSequence(gazetteers.data.cuda(), gazetteers.batch_sizes),
                   PackedSequence(batch_tags.data.cuda(), batch_tags.batch_sizes))
-                 for sentences, batch_tags in eval_data]
+                 for sentences, gazetteers, batch_tags in eval_data]
 
 
 #optimizer = torch.optim.SGD(model.parameters(), lr=0.01, weight_decay=1e-4)
@@ -383,8 +395,8 @@ def evaluation(model, data):
     correct = 0
     true = 0
     pos = 0
-    for sentences, gold_tags in data:
-        pred = model(sentences)
+    for sentences, gazetteers, gold_tags in data:
+        pred = model(sentences, gazetteers)
         gold_tags = unpack(gold_tags)
 
         #print(gold_tags)
@@ -415,14 +427,14 @@ for epoch in range(10):  # again, normally you would NOT do 300 epochs, it is to
     import time
     start_time = time.time()
 
-    for index, (batch_sentence, batch_tags) in enumerate(training_data):
+    for index, (batch_sentence, batch_gazetteers, batch_tags) in enumerate(training_data):
         model.train()
         # Step 1. Remember that Pytorch accumulates gradients.
         # We need to clear them out before each instance
         model.zero_grad()
 
         # Step 2. Run our forward pass.
-        batch_crf_loss, batch_lm_loss = model.loss(batch_sentence, batch_tags)
+        batch_crf_loss, batch_lm_loss = model.loss(batch_sentence, batch_gazetteers, batch_tags)
 
 
         batch_loss = batch_crf_loss + batch_lm_loss * config.lm_weight
@@ -455,8 +467,8 @@ for epoch in range(10):  # again, normally you would NOT do 300 epochs, it is to
             valid_lm_loss = 0
             valid_total_loss = 0
             valid_len = len(valid_data)
-            for sentences, tags in valid_data:
-                batch_valid_crf_loss, batch_valid_lm_loss = model.loss(sentences, tags)
+            for sentences, gazetteers, tags in valid_data:
+                batch_valid_crf_loss, batch_valid_lm_loss = model.loss(sentences, gazetteers, tags)
                 valid_crf_loss += batch_valid_crf_loss.data[0]
                 valid_lm_loss += batch_valid_lm_loss.data[0]
                 valid_loss = batch_valid_crf_loss + batch_valid_lm_loss * config.lm_weight
@@ -476,8 +488,8 @@ for epoch in range(10):  # again, normally you would NOT do 300 epochs, it is to
             '''
 
             # sample
-            sentences, gold_tags = valid_data[random.randint(0, len(valid_data) - 1)]
-            for sentence, pred in zip(unpack(sentences), model(sentences)):
+            sentences, gazetteers, gold_tags = valid_data[random.randint(0, len(valid_data) - 1)]
+            for sentence, pred in zip(unpack(sentences), model(sentences, gazetteers)):
                 pred_score, tag_ixs = pred
                 print(pred_score)
                 seg = ''.join([vocab.get_word(word) + ' ' if tagger.is_split(ix) else vocab.get_word(word)

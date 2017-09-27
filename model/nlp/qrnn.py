@@ -19,6 +19,7 @@ class Gates(nn.Module):
         '''
         # batch * length * channel -> batch * channel * length
         input = input.transpose(1, 2).contiguous()
+
         gates = self.conv(input)
         # batch * channel * length -> batch * length * channel
         gates = gates.transpose(1, 2).contiguous()
@@ -33,6 +34,7 @@ class Gates(nn.Module):
 
 
 class QRNNLayer(nn.Module):
+
     def __init__(self, input_dim, output_dim, kernel_size, bidirectional=True):
         super(QRNNLayer, self).__init__()
 
@@ -110,11 +112,12 @@ class QRNN(nn.Module):
         self.num_directions = 2 if bidirectional else 1
 
         input_dim = self.input_dim
-        self.layers = []
+        layers = []
         for l in range(self.num_layers):
             layer = QRNNLayer(input_dim, self.output_dim, self.kernel_size, bidirectional=self.bidirectional)
-            self.layers.append(layer)
+            layers.append(layer)
             input_dim = self.output_dim * self.num_directions
+        self.hiddens = nn.ModuleList(layers)
 
         self.dropout = nn.Dropout(dropout)
 
