@@ -295,7 +295,7 @@ class Config:
         self.hidden_mode = 'QRNN'
         self.num_hidden_layer = 2
         self.dropout = 0.3
-        self.use_cuda = False
+        self.use_cuda = True
 
         self.data_root = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/'
         #self.data_root = '/home/sunqf/Work/chinese_segment/data'
