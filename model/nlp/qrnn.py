@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.autograd.variable import Variable
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence, PackedSequence
 
@@ -33,7 +34,7 @@ class Gates(nn.Module):
 
 
 class QRNNLayer(nn.Module):
-    def __init__(self, input_dim, output_dim, kernel_size, bidirectional=True):
+    def __init__(self, input_dim, output_dim, kernel_size, bidirectional=True, dropout=0.):
         super(QRNNLayer, self).__init__()
 
         self.input_dim = input_dim
@@ -45,6 +46,8 @@ class QRNNLayer(nn.Module):
         self.bidirectional = bidirectional
         if self.bidirectional:
             self.reverse_gates = Gates(self.input_dim, self.output_dim, self.kernel_size)
+
+        self.dropout = dropout
 
     def pool(self, input, f, o, z, init_cell):
         max_batch_size = input.size(0)
@@ -82,13 +85,13 @@ class QRNNLayer(nn.Module):
 
     def forward(self, input, lengths, init_cell=None):
 
-        f, o, z = self.gates(input)
+        f, o, z = self.gates(self.gate_dropout(input, self.dropout))
 
         hidden, cell = self.pool(input, f, o, z, init_cell)
         last = (hidden, cell)
         # reverse
         if self.bidirectional:
-            f, o, z = self.reverse_gates(input)
+            f, o, z = self.reverse_gates(self.gate_dropout(input, self.dropout))
             rhidden, rcell = self.reverse_pool(input, f, o, z, init_cell)
 
             output = torch.cat([hidden, rhidden], -1)
@@ -97,9 +100,17 @@ class QRNNLayer(nn.Module):
 
         return output, last
 
+    def gate_dropout(self, input, dropout):
+
+        if self.training and (dropout > 0.):
+            mask = Variable(input.data.new(input.size(0), 1, input.size(2)).bernoulli_(1 - dropout).div_(1 - dropout))
+            return input * mask.expand_as(input)
+        else:
+            return input
+
 
 class QRNN(nn.Module):
-    def __init__(self, input_dim, output_dim, num_layers, kernel_size=3, bidirectional=True, dropout=0.5):
+    def __init__(self, input_dim, output_dim, num_layers, kernel_size=3, bidirectional=True, dropout=0.):
         super(QRNN, self).__init__()
 
         self.input_dim = input_dim
@@ -112,13 +123,15 @@ class QRNN(nn.Module):
         input_dim = self.input_dim
         layers = []
         for l in range(self.num_layers):
-            layer = QRNNLayer(input_dim, self.output_dim, self.kernel_size, bidirectional=self.bidirectional)
+            layer = QRNNLayer(input_dim, self.output_dim, self.kernel_size,
+                              bidirectional=self.bidirectional,
+                              dropout=dropout)
             layers.append(layer)
             input_dim = self.output_dim * self.num_directions
 
         self.layers = nn.ModuleList(layers)
 
-        self.dropout = nn.Dropout(dropout)
+
 
     def forward(self, data, init_cell=None):
         is_packed = isinstance(data, PackedSequence)
@@ -132,7 +145,6 @@ class QRNN(nn.Module):
         lasts = []
         output = data
         for layer in self.layers:
-            output = self.dropout(output)
             output, last = layer(output, lengths)
             lasts.append(last)
 
@@ -141,3 +153,7 @@ class QRNN(nn.Module):
         cell = torch.cat(cells, 0).view(self.num_directions * self.num_layers, batch_size, self.output_dim)
 
         return pack_padded_sequence(output, lengths, batch_first=True), (hidden, cell)
+
+
+
+

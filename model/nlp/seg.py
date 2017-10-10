@@ -29,8 +29,8 @@ class Embedding(nn.Module):
 
         if gazetteers is not None:
             self.gazetteers = gazetteers
-            self.gazetteers_embeddings = [nn.Linear(gazetteer.length(), embedding_dim)
-                               for gazetteer in gazetteers]
+            self.gazetteers_embeddings = nn.ModuleList(
+                    [nn.Linear(gazetteer.length(), embedding_dim) for gazetteer in gazetteers])
             self.gazetteers_len = [gazetteer.length() for gazetteer in gazetteers]
 
             self.gazetteers_index = [0] + list(itertools.accumulate(self.gazetteers_len))[0:-1]
@@ -251,14 +251,14 @@ class BiLSTMCRF(nn.Module):
         if self.hidden_mode == 'QRNN':
             from .qrnn import QRNN
             self.hidden_module = QRNN(self.embedding_dim, self.hidden_dim, self.num_hidden_layer,
-                                      kernel_size=5, dropout = config.dropout)
+                                      kernel_size=1, dropout = config.dropout)
         else:
             self.hidden_module = nn.LSTM(self.embedding_dim, self.hidden_dim, num_layers=self.num_hidden_layer,
                                          bidirectional=True, dropout=dropout)
 
         # output layer
         self.crf = CRFLayer(embedding_dim * 2, num_label, dropout)
-        self.lm = LanguageModel(embedding_dim, vocab_size, self.word_embeds.weight, bidirectional=True, dropout=dropout)
+        #self.lm = LanguageModel(embedding_dim, vocab_size, self.word_embeds.weight, bidirectional=True, dropout=dropout)
 
 
     def _get_features(self, input, gazetteers):
@@ -281,7 +281,8 @@ class BiLSTMCRF(nn.Module):
 
     def loss(self, sentence, gazetteers, tags):
         feats = self._get_features(sentence, gazetteers)
-        return self.crf.neg_log_likelihood(feats, tags), self.lm.criterion(sentence, feats)
+        #return self.crf.neg_log_likelihood(feats, tags), self.lm.criterion(sentence, feats)
+        return self.crf.neg_log_likelihood(feats, tags)
 
 
 
@@ -297,8 +298,8 @@ class Config:
         self.dropout = 0.3
         self.use_cuda = True
 
-        self.data_root = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/'
-        #self.data_root = '/home/sunqf/Work/chinese_segment/data'
+        #self.data_root = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/'
+        self.data_root = '/home/sunqf/Work/chinese_segment/data'
         self.train_paths = [os.path.join(self.data_root, 'train/train.all')]
         self.eval_paths = [os.path.join(self.data_root, 'gold', path)
                            for path in ['bosonnlp/auto_comments.txt', 'bosonnlp/food_comments.txt',
@@ -435,13 +436,15 @@ for epoch in range(10):  # again, normally you would NOT do 300 epochs, it is to
         model.zero_grad()
 
         # Step 2. Run our forward pass.
-        batch_crf_loss, batch_lm_loss = model.loss(batch_sentence, batch_gazetteers, batch_tags)
+        #batch_crf_loss, batch_lm_loss = model.loss(batch_sentence, batch_gazetteers, batch_tags)
+        batch_crf_loss = model.loss(batch_sentence, batch_gazetteers, batch_tags)
 
 
-        batch_loss = batch_crf_loss + batch_lm_loss * config.lm_weight
+        #batch_loss = batch_crf_loss + batch_lm_loss * config.lm_weight
+        batch_loss = batch_crf_loss #+ batch_lm_loss * config.lm_weight
 
         crf_loss += batch_crf_loss.data[0]
-        lm_loss += batch_lm_loss.data[0]
+        #lm_loss += batch_lm_loss.data[0]
         total_loss += batch_loss.data[0]
 
         # Step 3. Compute the loss, gradients, and update the parameters by
@@ -469,10 +472,12 @@ for epoch in range(10):  # again, normally you would NOT do 300 epochs, it is to
             valid_total_loss = 0
             valid_len = len(valid_data)
             for sentences, gazetteers, tags in valid_data:
-                batch_valid_crf_loss, batch_valid_lm_loss = model.loss(sentences, gazetteers, tags)
+                #batch_valid_crf_loss, batch_valid_lm_loss = model.loss(sentences, gazetteers, tags)
+                batch_valid_crf_loss = model.loss(sentences, gazetteers, tags)
+
                 valid_crf_loss += batch_valid_crf_loss.data[0]
-                valid_lm_loss += batch_valid_lm_loss.data[0]
-                valid_loss = batch_valid_crf_loss + batch_valid_lm_loss * config.lm_weight
+                #valid_lm_loss += batch_valid_lm_loss.data[0]
+                valid_loss = batch_valid_crf_loss #+ batch_valid_lm_loss * config.lm_weight
                 valid_total_loss += valid_loss.data[0]
 
             print('valid: total loss = %f, crf loss = %f, lm loss = %f, lm ppl = %f' %
