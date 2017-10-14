@@ -170,6 +170,7 @@ class CRFLayer(nn.Module):
         sentences, lens = pad_packed_sequence(emissions, batch_first=True)
         return [self._viterbi_decode(sentence[:len]) for sentence, len in zip(sentences, lens)]
 
+
 class LanguageModel(nn.Module):
 
     def __init__(self, dim, num_vocab, shared_weight, bidirectional=True, dropout=0.5):
@@ -236,7 +237,8 @@ class LanguageModel(nn.Module):
 
 
 class BiLSTMCRF(nn.Module):
-    def __init__(self, vocab_size, num_label, gazetteers, embedding_dim, hidden_mode, num_hidden_layer=1, dropout=0.5):
+
+    def __init__(self, vocab_size, num_label, gazetteers, embedding_dim, hidden_mode, num_hidden_layer=1, kernel_sizes=None, dropout=0.5):
         super(BiLSTMCRF, self).__init__()
         self.embedding_dim = embedding_dim
         self.word_embeds = nn.Embedding(vocab_size, embedding_dim)
@@ -244,6 +246,7 @@ class BiLSTMCRF(nn.Module):
 
         self.hidden_dim = self.embedding_dim
         self.num_hidden_layer = num_hidden_layer
+        self.kernel_sizes = kernel_sizes
         self.num_direction = 2
 
         self.hidden_mode = hidden_mode
@@ -251,14 +254,13 @@ class BiLSTMCRF(nn.Module):
         if self.hidden_mode == 'QRNN':
             from .qrnn import QRNN
             self.hidden_module = QRNN(self.embedding_dim, self.hidden_dim, self.num_hidden_layer,
-                                      kernel_size=1, dropout = config.dropout)
+                                      kernel_sizes=self.kernel_sizes, dropout = config.dropout)
         else:
             self.hidden_module = nn.LSTM(self.embedding_dim, self.hidden_dim, num_layers=self.num_hidden_layer,
                                          bidirectional=True, dropout=dropout)
 
         # output layer
         self.crf = CRFLayer(embedding_dim * 2, num_label, dropout)
-        #self.lm = LanguageModel(embedding_dim, vocab_size, self.word_embeds.weight, bidirectional=True, dropout=dropout)
 
 
     def _get_features(self, input, gazetteers):
@@ -281,7 +283,6 @@ class BiLSTMCRF(nn.Module):
 
     def loss(self, sentence, gazetteers, tags):
         feats = self._get_features(sentence, gazetteers)
-        #return self.crf.neg_log_likelihood(feats, tags), self.lm.criterion(sentence, feats)
         return self.crf.neg_log_likelihood(feats, tags)
 
 
@@ -295,6 +296,8 @@ class Config:
         self.embedding_size = 128
         self.hidden_mode = 'QRNN'
         self.num_hidden_layer = 2
+        self.kernel_sizes = [5, 3]
+
         self.dropout = 0.3
         self.use_cuda = True
 
@@ -335,7 +338,7 @@ random.shuffle(eval_data)
 valid_data, eval_data = train_test_split(eval_data, test_size=0.7)
 
 model = BiLSTMCRF(len(vocab), len(tagger), gazetteers, config.embedding_size,
-                  config.hidden_mode, config.num_hidden_layer, config.dropout)
+                  config.hidden_mode, config.num_hidden_layer, config.kernel_sizes, config.dropout)
 
 if config.use_cuda:
     model = model.cuda()

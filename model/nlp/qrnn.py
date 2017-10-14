@@ -4,6 +4,8 @@ from torch.autograd.variable import Variable
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence, PackedSequence
 
+import itertools
+
 
 class Gates(nn.Module):
     def __init__(self, input_dim, output_dim, kernel_size):
@@ -110,27 +112,38 @@ class QRNNLayer(nn.Module):
 
 
 class QRNN(nn.Module):
-    def __init__(self, input_dim, output_dim, num_layers, kernel_size=3, bidirectional=True, dropout=0.):
+    def __init__(self, input_dim, output_dim, num_layers, kernel_sizes=3, bidirectional=True, dropout=0.):
         super(QRNN, self).__init__()
 
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.num_layers = num_layers
-        self.kernel_size = kernel_size
+        if isinstance(kernel_sizes, int) and kernel_sizes % 2 == 1:
+            self.kernel_sizes = [kernel_sizes] * num_layers
+        elif isinstance(kernel_sizes, list):
+            if len(itertools.filterfalse(lambda x: x % 2 == 1, kernel_sizes)) > 0:
+                raise Exception("Elements of kernel_sizes should be odd.")
+
+            if len(kernel_sizes) == num_layers and kernel_sizes % 2 == 1:
+                self.kernel_sizes = kernel_sizes
+            else:
+                raise Exception("length of kernel_sizes should be equal to num_layers")
+        elif kernel_sizes is None:
+            self.kernel_sizes = [3] * num_layers
+
         self.bidirectional = bidirectional
         self.num_directions = 2 if bidirectional else 1
 
         input_dim = self.input_dim
         layers = []
         for l in range(self.num_layers):
-            layer = QRNNLayer(input_dim, self.output_dim, self.kernel_size,
+            layer = QRNNLayer(input_dim, self.output_dim, self.kernel_sizes[l],
                               bidirectional=self.bidirectional,
                               dropout=dropout)
             layers.append(layer)
             input_dim = self.output_dim * self.num_directions
 
         self.layers = nn.ModuleList(layers)
-
 
 
     def forward(self, data, init_cell=None):
