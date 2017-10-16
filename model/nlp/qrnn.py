@@ -121,10 +121,7 @@ class QRNN(nn.Module):
         if isinstance(kernel_sizes, int) and kernel_sizes % 2 == 1:
             self.kernel_sizes = [kernel_sizes] * num_layers
         elif isinstance(kernel_sizes, list):
-            if len(itertools.filterfalse(lambda x: x % 2 == 1, kernel_sizes)) > 0:
-                raise Exception("Elements of kernel_sizes should be odd.")
-
-            if len(kernel_sizes) == num_layers and kernel_sizes % 2 == 1:
+            if len(kernel_sizes) == num_layers:
                 self.kernel_sizes = kernel_sizes
             else:
                 raise Exception("length of kernel_sizes should be equal to num_layers")
