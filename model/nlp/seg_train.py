@@ -45,7 +45,7 @@ class SegTrainer:
         self._to_cuda()
 
     def _fine_init(self):
-        self.vocab, self.gazetteers, self.tagger, self.coarse_training_data = self.loader.get_data(self.config.fine_train_paths, self.config.batch_size)
+        self.vocab, self.gazetteers, self.tagger, self.training_data = self.loader.get_data(self.config.fine_train_paths, self.config.batch_size)
 
         eval_data = list(self.loader.batch(self.config.fine_eval_paths, self.config.batch_size))
 
