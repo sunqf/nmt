@@ -14,8 +14,8 @@ class Config:
         self.dropout = 0.3
         self.use_cuda = False
 
-        self.data_root = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/'
-        #self.data_root = '/home/sunqf/Work/chinese_segment/data'
+        #self.data_root = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/'
+        self.data_root = '/home/sunqf/Work/chinese_segment/data'
         self.coarse_train_paths = [os.path.join(self.data_root, 'train/train.all')]
         self.coarse_eval_paths = [os.path.join(self.data_root, 'gold', path)
                                   for path in ['bosonnlp/auto_comments.txt', 'bosonnlp/food_comments.txt',

@@ -131,7 +131,7 @@ class SegTrainer:
         if self.coarse:
             self._coarse_init()
             self.optimizer = torch.optim.Adam(self.model.parameters())
-            self.scheduler = StepLR(self.optimizer, step_size=2, gamma=0.1)
+            self.scheduler = StepLR(self.optimizer, step_size=5, gamma=0.1)
 
             log_prefix = 'coarse phase'
             # Make sure prepare_sequence from earlier in the LSTM section is loaded
@@ -150,7 +150,7 @@ class SegTrainer:
         if self.fine:
             self._fine_init()
             self.optimizer = torch.optim.Adam(self.model.parameters())
-            self.scheduler = StepLR(self.optimizer, step_size=2, gamma=0.1)
+            self.scheduler = StepLR(self.optimizer, step_size=5, gamma=0.1)
 
             log_prefix = 'fine phase'
             # Make sure prepare_sequence from earlier in the LSTM section is loaded
