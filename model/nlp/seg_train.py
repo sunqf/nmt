@@ -28,18 +28,19 @@ class SegTrainer:
         self.fine = fine
 
     def _coarse_init(self):
-        self.vocab, self.gazetteers, self.tagger, self.training_data = self.loader.get_data(self.config.fine_train_paths, self.config.batch_size)
+        self.vocab, self.gazetteers, self.tagger, self.training_data = self.loader.get_data(self.config.coarse_train_paths, self.config.batch_size)
 
-        eval_data = list(self.loader.batch(self.config.fine_eval_paths, self.config.batch_size))
+        eval_data = list(self.loader.batch(self.config.coarse_eval_paths, self.config.batch_size))
 
         import random
         random.shuffle(self.training_data)
         random.shuffle(eval_data)
 
-        self.valid_data, self.eval_data = train_test_split(eval_data, test_size=0.2)
+        self.valid_data, self.eval_data = train_test_split(eval_data, test_size=0.7)
 
         self.model = BiLSTMCRF(len(self.vocab), len(self.tagger), self.gazetteers, self.config.embedding_dim,
-                               self.config.hidden_mode, self.config.num_hidden_layer, self.config.kernel_sizes, self.config.dropout)
+                               self.config.hidden_mode, self.config.hidden_dim, self.config.num_hidden_layer,
+                               self.config.window_sizes, self.config.dropout)
 
         self._to_cuda()
 
@@ -52,7 +53,7 @@ class SegTrainer:
         random.shuffle(self.training_data)
         random.shuffle(eval_data)
 
-        self.valid_data, self.eval_data = train_test_split(eval_data, test_size=0.2)
+        self.valid_data, self.eval_data = train_test_split(eval_data, test_size=0.7)
 
         if hasattr(self, 'model') is False:
             with open('%s.coarse.%d' % (self.config.model_prefix, self.config.epoch - 1)) as file:
@@ -233,7 +234,7 @@ class SegTrainer:
                     print(log_prefix + ' dst: %s' % seg)
                 start_time = time.time()
 
-
+torch.set_num_threads(10)
 
 trainer = SegTrainer(Config(), True, True)
 

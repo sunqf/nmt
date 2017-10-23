@@ -302,7 +302,7 @@ class DataLoader:
         return self.dim
 
     def batch(self, paths, batch_size):
-        data = list(self.load(paths))[0:500000]
+        data = list(self.load(paths))[0:50000]
         data = sorted(data, key=lambda item: len(item[0]), reverse=True)
 
         for start in range(0, len(data), batch_size):

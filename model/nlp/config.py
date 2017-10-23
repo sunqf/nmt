@@ -4,14 +4,15 @@ import os
 class Config:
     def __init__(self):
         self.max_vocab_size = 5000
-        self.batch_size = 32
-        self.embedding_dim = 128
+        self.batch_size = 16
+        self.embedding_dim = 64
         self.hidden_mode = 'QRNN'
         self.num_hidden_layer = 2
-        self.kernel_sizes = [5, 3]
+        self.hidden_dim = 128
+        self.window_sizes = [2, 2]
 
         self.dropout = 0.3
-        self.use_cuda = True
+        self.use_cuda = False
 
         self.data_root = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/'
         #self.data_root = '/home/sunqf/Work/chinese_segment/data'

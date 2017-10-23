@@ -25,6 +25,8 @@ class Embedding(nn.Module):
         self.word_embedding = word_embedding
         self.embedding_dim = embedding_dim
 
+        self.output_dim = self.embedding_dim
+
         if gazetteers is not None:
             self.gazetteers = gazetteers
             self.gazetteers_embeddings = nn.ModuleList(
@@ -32,6 +34,10 @@ class Embedding(nn.Module):
             self.gazetteers_len = [gazetteer.length() for gazetteer in gazetteers]
 
             self.gazetteers_index = [0] + list(itertools.accumulate(self.gazetteers_len))[0:-1]
+            self.output_dim += self.embedding_dim
+
+    def output_dim(self):
+        return self.output_dim
 
     def forward(self, sentence, gazetteers):
         '''
@@ -49,7 +55,7 @@ class Embedding(nn.Module):
                        for embedding, (start, length) in zip(self.gazetteers_embeddings,
                                                              zip(self.gazetteers_index, self.gazetteers_len))]
 
-        output = word_emb + torch.cat(outputs, -1).sum(-1)
+        output = word_emb + torch.cat([word_emb, *outputs], -1).sum(-1)
 
         return PackedSequence(output, batch_sizes)
 
@@ -233,16 +239,16 @@ class LanguageModel(nn.Module):
 
 
 class BiLSTMCRF(nn.Module):
-    def __init__(self, vocab_size, num_label, gazetteers, embedding_dim, hidden_mode, num_hidden_layer=1,
-                 kernel_sizes=None, dropout=0.5):
+    def __init__(self, vocab_size, num_label, gazetteers, embedding_dim, hidden_mode, hidden_dim, num_hidden_layer=1,
+                 window_sizes=None, dropout=0.5):
         super(BiLSTMCRF, self).__init__()
         self.embedding_dim = embedding_dim
         self.word_embeds = nn.Embedding(vocab_size, self.embedding_dim)
         self.input_embed = Embedding(self.word_embeds, self.embedding_dim, gazetteers)
 
-        self.hidden_dim = self.embedding_dim
+        self.hidden_dim = hidden_dim
         self.num_hidden_layer = num_hidden_layer
-        self.kernel_sizes = kernel_sizes
+        self.window_sizes = window_sizes
         self.num_direction = 2
 
         self.hidden_mode = hidden_mode
@@ -250,7 +256,7 @@ class BiLSTMCRF(nn.Module):
         if self.hidden_mode == 'QRNN':
             from .qrnn import QRNN
             self.hidden_module = QRNN(self.embedding_dim, self.hidden_dim, self.num_hidden_layer,
-                                      kernel_sizes=self.kernel_sizes, dropout=dropout)
+                                      window_sizes=self.window_sizes, dropout=dropout)
         else:
             self.hidden_module = nn.LSTM(self.embedding_dim, self.hidden_dim, num_layers=self.num_hidden_layer,
                                          bidirectional=True, dropout=dropout)
