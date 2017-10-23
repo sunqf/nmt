@@ -4,17 +4,17 @@ import os
 class Config:
     def __init__(self):
         self.max_vocab_size = 5000
-        self.batch_size = 32
-        self.embedding_dim = 128
+        self.batch_size = 8
+        self.embedding_dim = 512
         self.hidden_mode = 'QRNN'
         self.num_hidden_layer = 2
-        self.kernel_sizes = [5, 3]
+        self.kernel_sizes = [3, 3]
 
         self.dropout = 0.3
         self.use_cuda = True
 
-        self.data_root = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/'
-        #self.data_root = '/home/sunqf/Work/chinese_segment/data'
+        #self.data_root = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/'
+        self.data_root = '/home/sunqf/Work/chinese_segment/data'
         self.coarse_train_paths = [os.path.join(self.data_root, 'train/train.all')]
         self.coarse_eval_paths = [os.path.join(self.data_root, 'gold', path)
                                   for path in ['bosonnlp/auto_comments.txt', 'bosonnlp/food_comments.txt',

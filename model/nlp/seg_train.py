@@ -28,6 +28,22 @@ class SegTrainer:
         self.fine = fine
 
     def _coarse_init(self):
+        self.vocab, self.gazetteers, self.tagger, self.training_data = self.loader.get_data(self.config.coarse_train_paths, self.config.batch_size)
+
+        eval_data = list(self.loader.batch(self.config.coarse_eval_paths, self.config.batch_size))
+
+        import random
+        random.shuffle(self.training_data)
+        random.shuffle(eval_data)
+
+        self.valid_data, self.eval_data = train_test_split(eval_data, test_size=0.7)
+
+        self.model = BiLSTMCRF(len(self.vocab), len(self.tagger), self.gazetteers, self.config.embedding_dim,
+                               self.config.hidden_mode, self.config.num_hidden_layer, self.config.kernel_sizes, self.config.dropout)
+
+        self._to_cuda()
+
+    def _fine_init(self):
         self.vocab, self.gazetteers, self.tagger, self.training_data = self.loader.get_data(self.config.fine_train_paths, self.config.batch_size)
 
         eval_data = list(self.loader.batch(self.config.fine_eval_paths, self.config.batch_size))
@@ -36,23 +52,7 @@ class SegTrainer:
         random.shuffle(self.training_data)
         random.shuffle(eval_data)
 
-        self.valid_data, self.eval_data = train_test_split(eval_data, test_size=0.2)
-
-        self.model = BiLSTMCRF(len(self.vocab), len(self.tagger), self.gazetteers, self.config.embedding_dim,
-                               self.config.hidden_mode, self.config.num_hidden_layer, self.config.kernel_sizes, self.config.dropout)
-
-        self._to_cuda()
-
-    def _fine_init(self):
-        self.vocab, self.gazetteers, self.tagger, self.coarse_training_data = self.loader.get_data(self.config.fine_train_paths, self.config.batch_size)
-
-        eval_data = list(self.loader.batch(self.config.fine_eval_paths, self.config.batch_size))
-
-        import random
-        random.shuffle(self.training_data)
-        random.shuffle(eval_data)
-
-        self.valid_data, self.eval_data = train_test_split(eval_data, test_size=0.2)
+        self.valid_data, self.eval_data = train_test_split(eval_data, test_size=0.7)
 
         if hasattr(self, 'model') is False:
             with open('%s.coarse.%d' % (self.config.model_prefix, self.config.epoch - 1)) as file:
@@ -130,7 +130,7 @@ class SegTrainer:
         if self.coarse:
             self._coarse_init()
             self.optimizer = torch.optim.Adam(self.model.parameters())
-            self.scheduler = StepLR(self.optimizer, step_size=2, gamma=0.1)
+            self.scheduler = StepLR(self.optimizer, step_size=5, gamma=0.1)
 
             log_prefix = 'coarse phase'
             # Make sure prepare_sequence from earlier in the LSTM section is loaded
