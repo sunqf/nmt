@@ -88,13 +88,27 @@ gold_pos_file = [t + ".pos" for t in gold_file]
 with open('ctb.pos.train', 'w') as train, open('ctb.pos.gold', 'w') as gold:
     for file in os.listdir(ctb_pos_path):
         with open(os.path.join(ctb_pos_path, file)) as f:
-            xml = BeautifulSoup(f, "xml")
-            print(xml.prettify())
-            sentences = [s.get_text() for s in xml.find_all('S')]
+            '''
+            xml = BeautifulSoup(f, "lxml")
+            if file.endswith('mz.pos') or file.endswith('nw.pos'):
+                sentences = [s.get_text() for s in xml.find_all('s')]
+            elif file.endswith('bn.pos'):
+                sentences = [s.get_text() for s in xml.find_all('text')]
+            elif file.endswith('pos'):
+                sentences = [s.get_text() for s in xml.find_all('su')]
+
+            print(file)
+            print(sentences)
             if file in gold_pos_file:
                 gold.writelines(sentences)
             else:
                 train.writelines(sentences)
+            '''
+            for line in f:
+                if re.match('^<.*> *$', line) is None and len(line.strip()) > 0:
+                    if file in gold_pos_file:
+                        gold.write(line)
+                    else:
+                        train.write(line)
 
-        break
 

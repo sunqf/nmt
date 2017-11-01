@@ -173,16 +173,16 @@ class QRNN(nn.Module):
         self.window_sizes = window_sizes
 
         self.bidirectional = bidirectional
-        self.num_directions = 2 if bidirectional else 1
+        self.num_direction = 2 if bidirectional else 1
 
         input_dim = self.input_dim
         layers = []
         for l in range(self.num_layers):
-            layer = QRNNLayer(input_dim, self.hidden_dims, self.window_sizes[l],
+            layer = QRNNLayer(input_dim, self.hidden_dim, self.window_sizes[l],
                               bidirectional=self.bidirectional,
                               dropout=dropout)
             layers.append(layer)
-            input_dim = self.hidden_dims * self.num_directions
+            input_dim = self.hidden_dim * self.num_direction
 
         self.layers = nn.ModuleList(layers)
 
@@ -207,8 +207,8 @@ class QRNN(nn.Module):
             lasts.append(last)
 
         hiddens, cells = zip(*lasts)
-        hidden = torch.cat(hiddens, 0).view(self.num_directions * self.num_layers, batch_size, self.hidden_dim)
-        cell = torch.cat(cells, 0).view(self.num_directions * self.num_layers, batch_size, self.hidden_dim)
+        hidden = torch.cat(hiddens, 0).view(self.num_direction * self.num_layers, batch_size, self.hidden_dim)
+        cell = torch.cat(cells, 0).view(self.num_direction * self.num_layers, batch_size, self.hidden_dim)
 
         return pack_padded_sequence(output, lengths, batch_first=False), (hidden, cell)
 

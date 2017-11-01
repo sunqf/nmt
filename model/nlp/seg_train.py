@@ -1,9 +1,5 @@
 
-import os
-import math
 from torch.nn.utils.rnn import pad_packed_sequence, PackedSequence
-
-from torch import nn
 
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import StepLR
@@ -13,8 +9,6 @@ from .crf import BiLSTMCRF
 from .config import Config
 
 from .loader import DataLoader
-import pickle
-
 import random
 
 
@@ -22,15 +16,28 @@ class SegTrainer:
 
     def __init__(self, config=Config(), coarse=True, fine=True):
         self.config = config
-        self.loader = DataLoader(config.coarse_train_paths, config.char_attr, config.wordset, config.max_vocab_size)
+
 
         self.coarse = coarse
         self.fine = fine
 
     def _coarse_init(self):
-        self.vocab, self.gazetteers, self.tagger, self.training_data = self.loader.get_data(self.config.coarse_train_paths, self.config.batch_size)
+        self.loader = DataLoader.build(self.config.fine_train_paths,
+                                       self.config.char_attr,
+                                       self.config.wordset,
+                                       self.config.max_vocab_size,
+                                       with_type=True)
+        self.vocab = self.loader.get_vocab()
+        self.gazetteers = self.loader.get_gazetteers()
+        self.tagger = self.loader.get_tagger()
 
-        eval_data = list(self.loader.batch(self.config.coarse_eval_paths, self.config.batch_size))
+
+
+
+        self.training_data =\
+            list(self.loader.get_data(self.config.fine_train_paths, self.config.batch_size))
+
+        eval_data = list(self.loader.get_data(self.config.fine_eval_paths, self.config.batch_size))
 
         import random
         random.shuffle(self.training_data)
@@ -45,9 +52,10 @@ class SegTrainer:
         self._to_cuda()
 
     def _fine_init(self):
-        self.vocab, self.gazetteers, self.tagger, self.training_data = self.loader.get_data(self.config.fine_train_paths, self.config.batch_size)
 
-        eval_data = list(self.loader.batch(self.config.fine_eval_paths, self.config.batch_size))
+        self.training_data = list(self.loader.get_data(self.config.fine_train_paths, self.config.batch_size))
+
+        eval_data = list(self.loader.get_data(self.config.fine_eval_paths, self.config.batch_size))
 
         import random
         random.shuffle(self.training_data)
@@ -130,6 +138,7 @@ class SegTrainer:
 
         if self.coarse:
             self._coarse_init()
+            print("Start coarse training.")
             self.optimizer = torch.optim.Adam(self.model.parameters())
             self.scheduler = StepLR(self.optimizer, step_size=5, gamma=0.1)
 
@@ -149,6 +158,7 @@ class SegTrainer:
 
         if self.fine:
             self._fine_init()
+            print('Start fine training.')
             self.optimizer = torch.optim.Adam(self.model.parameters())
             self.scheduler = StepLR(self.optimizer, step_size=5, gamma=0.1)
 

@@ -2,6 +2,7 @@
 import os
 import collections
 from itertools import chain
+from collections import namedtuple, Iterable
 import torch
 from torch.autograd import Variable
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence, PackedSequence
@@ -11,7 +12,7 @@ import numpy as np
 
 class Converter:
 
-    def convert_all(self, sequence):
+    def convert(self, sequence):
         pass
 
     def length(self):
@@ -42,11 +43,11 @@ class Vocab(Converter):
     def vocabSize(self):
         return len(self.words)
 
-    def convert_one(self, word):
-        return np.array([self.word2ids.get(word, self.unk_idx)])
-
-    def convert_all(self, words):
-        return np.array([self.convert_one(word) for word in words])
+    def convert(self, data):
+        if isinstance(data, Iterable):
+            return np.array([np.array([self.word2ids.get(word, self.unk_idx)]) for word in data])
+        else:
+            return np.array([self.word2ids.get(data, self.unk_idx)])
 
     def length(self):
         return 1
@@ -58,6 +59,7 @@ class Vocab(Converter):
     def build(word_counts, vocab_size):
         if len(word_counts) > vocab_size:
             word_counts = sorted(word_counts.items(), key=lambda item: item[1], reverse=True)[:vocab_size]
+        else: word_counts = word_counts.items()
 
         return Vocab(list([word for word, count in word_counts]))
 
@@ -71,7 +73,7 @@ class Gazetteer(Converter):
         self.length2words = length2words
         self.max_len = max(self.length2words.items(), key=lambda item: item[0])
 
-    def convert_all(self, sequence):
+    def convert(self, sequence):
 
         res = np.zeros([len(sequence), self.max_len], dtype=np.float)
 
@@ -102,50 +104,62 @@ class Gazetteer(Converter):
             return Gazetteer(name, length2words)
 
 
+CharInfo = namedtuple("CharInfo", ["word", "pinyins", "attrs"])
 
 # 汉字属性字典
 class CharacterAttribute(Converter):
 
-    def __init__(self, attrs, word2attr):
+    def __init__(self, attrs, pinyins, char2info):
         self.attrs = attrs
+        self.pinyins = pinyins
         self.attr2id = dict([(id, attr) for id, attr in enumerate(attrs)])
-        self.word2attr = collections.defaultdict()
-        self.default_attr = np.array([0.0] * len(self.attrs))
+        self.pinyin2id = dict([(id, vowel) for id, vowel in enumerate(pinyins)])
+        self.char2attr = collections.defaultdict()
+        self.default_attr = np.array([0] * len(self.attrs))
+        self.char2pinyin = collections.defaultdict()
+        self.default_pinyin = np.array([0] * len(self.pinyins))
 
-        for word, list in word2attr.items():
-            self.word2attr[word] = np.array([1. if a in list else 0. for a in self.attrs])
+        print('pinyin', len(self.pinyins))
+        for word, info in char2info.items():
+            self.char2attr[word] = np.array([1 if a in info.attrs else 0 for a in self.attrs])
+            self.char2pinyin[word] = np.array([1 if p in info.pinyins else 0 for p in self.pinyins])
 
-    def convert_one(self, id):
-        return np.array([self.word2attr(id, self.default_attr)])
+    def convert_attr(self, data):
+        if isinstance(data, Iterable):
+            return np.array([self.char2attr.get(c, self.default_attr) for c in data])
+        else:
+            return np.array([self.char2attr.get(data, self.default_attr)])
 
-    def convert_all(self, sequence):
-        return np.array([self.word2attr.get(w, self.default_attr) for w in sequence])
+    def convert_pinyin(self, data):
+        if isinstance(data, Iterable):
+            return np.array([self.char2pinyin.get(c, self.default_pinyin) for c in data])
+        else:
+            return np.array([self.char2pinyin.get(data, self.default_pinyin)])
 
+    def convert(self, data):
+        return np.concatenate([self.convert_attr(data), self.convert_pinyin(data)], -1)
 
     def length(self):
-        return len(self.attrs)
+        return len(self.attrs) + len(self.pinyins)
 
 
     @staticmethod
     def load(dict_path):
         with open(dict_path) as file:
-            dict = collections.defaultdict()
+            char2info = collections.defaultdict()
             all_attrs = set()
+            all_pinyins = set()
+
             for line in file:
                 fields = line.split('\t')
                 word = fields[0]
                 attrs = fields[1].split()
-                dict[word] = attrs
+                pinyins = [' '.join(p.split('|')[1:]) for p in fields[2].split()]
+                char2info[word] = CharInfo(word, attrs, pinyins)
                 all_attrs.update(attrs)
+                all_pinyins.update(pinyins)
 
-            return CharacterAttribute(all_attrs, dict)
-
-
-START_TAG = "start"
-END_TAG = "end"
-tag_to_ix = {"B": 0, "I": 1, "E": 2, START_TAG: 3, END_TAG: 4}
-ix_to_tag = ['B', 'I', "E", START_TAG, END_TAG]
-
+            return CharacterAttribute(all_attrs, all_pinyins, char2info)
 
 class BIETagger:
     def __init__(self):
@@ -177,20 +191,22 @@ class BIETagger:
         return id == 2
 
 class BMESTagger:
-    def __init__(self):
-        self.tag2id = {'S': 0, 'B':1, 'M':2, 'E':3}
-        self.id2tag = ['S', 'B', 'M', 'E']
+    def __init__(self, tag_set):
+        self.id2tag = [tag for tag in tag_set]
+        self.tag2id = dict([(tag,i) for i, tag in enumerate(tag_set)])
+        self.split_ids = set([id for tag, id in self.tag2id.items() if tag.startswith('E_') or tag.startswith('S_')])
 
     def __len__(self):
         return len(self.tag2id)
 
-    def tag(self, word):
+    @staticmethod
+    def tag(word, tagType=''):
         if len(word) == 1:
-            return ['S']
+            return ['S_' + tagType]
         elif len(word) == 2:
-            return ['B', 'E']
+            return ['B_' + tagType, 'E_' + tagType]
         else:
-            return ['B'] + ['M'] * (len(word) - 2) + ['E']
+            return ['B_' + tagType] + ['M_' + tagType] * (len(word) - 2) + ['E_' + tagType]
 
     def getId(self, tag):
         return self.tag2id[tag]
@@ -199,7 +215,7 @@ class BMESTagger:
         return self.id2tag[id]
 
     def is_split(self, id):
-        return id == 3 or id == 0
+        return id in self.split_ids
 
 
 def strQ2B(ustring):
@@ -239,43 +255,51 @@ def tokenize(word):
         return list(word)
 
 class DataLoader:
-    def __init__(self, corpus_paths, char_attr_path, name2path, vocab_size=5000):
-        self.corpus_paths = corpus_paths
-        self.vocab_size = vocab_size
-        self.vocab = self._build_vocab(corpus_paths)
-        self.tagger = BMESTagger()
+    def __init__(self, vocab, tagger, gazetteers, with_type):
 
-        self.char2attr = CharacterAttribute.load(char_attr_path)
+        self.vocab = vocab
+        self.tagger = tagger
 
-        self.gazetteers = [self.char2attr] + [Gazetteer.load(name, path) for name, path in name2path]
+        self.gazetteers = gazetteers
 
         self.gazetteers_dim = sum([c.length() for c in self.gazetteers])
 
+        self.with_type = with_type
+
         #print('\n'.join('%d: %d' % (size, len(coll)) for size, coll in self.buckets))
 
-    def _get_size(self, len):
-        for size in self.bucket_sizes:
-            if size >= len:
-                return size
-        return None
-
-    def _count_word(self, corpus_paths):
+    @staticmethod
+    def count(corpus_paths, with_type=False):
         word_counts = collections.defaultdict(int)
-
+        tag_set = set()
         for path in corpus_paths:
+            print(corpus_paths)
             assert os.path.exists(path)
             with open(path, 'r') as file:
                 for line in file:
                     line = strQ2B(line)
                     for word in line.split():
-                        for ch in tokenize(word):
+                        if with_type:
+                            word, tag = word.rsplit('_', 1)
+                        else:
+                            tag = ''
+                        chars = tokenize(word)
+
+                        for ch in chars:
                             word_counts[ch] += 1
+                        tag_set.update(BMESTagger.tag(chars, tag))
 
-        return word_counts
+        return word_counts, tag_set
 
-    def _build_vocab(self, corpus_paths):
-        word_counts = self._count_word(corpus_paths)
-        return Vocab.build(word_counts, self.vocab_size)
+    @staticmethod
+    def build(corpus_paths, char_attr_path, name2path, vocab_size=5000, with_type=False):
+        word_counts, tag_set = DataLoader.count(corpus_paths, with_type)
+        vocab = Vocab.build(word_counts, vocab_size)
+        tagger = BMESTagger(tag_set)
+        char2attr = CharacterAttribute.load(char_attr_path)
+        gazetteers = [char2attr] + [Gazetteer.load(name, path) for name, path in name2path]
+
+        return DataLoader(vocab, tagger, gazetteers, with_type)
 
     def load(self, corpus_paths):
         for path in corpus_paths:
@@ -285,9 +309,16 @@ class DataLoader:
                 for line in file:
                     if len(line.strip()) > 0:
                         line = strQ2B(line)
-                        chars = [ch for word in line.split() for ch in tokenize(word)]
-                        tags = list(chain.from_iterable(
-                            [self.tagger.tag(tokenize(word)) for word in line.split()]))
+
+                        if self.with_type:
+                            word2tag = [w.rsplit('_', 1) for w in line.split()]
+                            chars = [c for word, tag in word2tag for c in tokenize(word)]
+                            tags = list(chain.from_iterable(
+                                [self.tagger.tag(tokenize(word), tagType) for word, tagType in word2tag]))
+                        else:
+                            chars = [ch for word in line.split() for ch in tokenize(word)]
+                            tags = list(chain.from_iterable(
+                                [self.tagger.tag(tokenize(word)) for word in line.split()]))
                         assert (len(chars) == len(tags))
                         yield chars, tags
 
@@ -295,13 +326,17 @@ class DataLoader:
     def get_vocab(self):
         return self.vocab
 
+    def get_gazetteers(self):
+        return self.gazetteers
+
     def get_tagger(self):
         return self.tagger
 
     def get_dim(self):
         return self.dim
 
-    def batch(self, paths, batch_size):
+
+    def get_data(self, paths, batch_size):
         data = list(self.load(paths))
         data = sorted(data, key=lambda item: len(item[0]), reverse=True)
 
@@ -316,17 +351,12 @@ class DataLoader:
 
             for i, (sent, tags) in enumerate(batch):
                 length = len(sent)
-                batch_sen[0:length, i] = torch.from_numpy(self.vocab.convert_all(sent))
+                batch_sen[0:length, i] = torch.from_numpy(self.vocab.convert(sent))
                 batch_gazetteers[0:length, i] = torch.from_numpy(
-                    np.concatenate([gazetteer.convert_all(sent) for gazetteer in self.gazetteers], -1))
+                    np.concatenate([gazetteer.convert(sent) for gazetteer in self.gazetteers], -1))
                 batch_tags[0:length, i] = torch.LongTensor([self.tagger.getId(tag) for tag in tags])
 
             yield (pack_padded_sequence(Variable(batch_sen), lens),
                    pack_padded_sequence(Variable(batch_gazetteers), lens),
                    pack_padded_sequence(Variable(batch_tags), lens))
-
-
-    def get_data(self, paths, batch_size):
-        return self.vocab, self.gazetteers, self.tagger, list(self.batch(paths, batch_size))
-
 
