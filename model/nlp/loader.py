@@ -283,7 +283,8 @@ class DataLoader:
             assert os.path.exists(path)
             with open(path, 'r') as file:
                 for line in file:
-                    if len(line.strip()) > 0:
+                    line = line.strip()
+                    if len(line) > 0 and len(line) < 300:
                         line = strQ2B(line)
                         chars = [ch for word in line.split() for ch in tokenize(word)]
                         tags = list(chain.from_iterable(

@@ -4,11 +4,11 @@ import os
 class Config:
     def __init__(self):
         self.max_vocab_size = 5000
-        self.batch_size = 32
-        self.embedding_dim = 64
+        self.batch_size = 16
+        self.embedding_dim = 128
         self.hidden_mode = 'QRNN'
         self.num_hidden_layer = 2
-        self.hidden_dim = 128
+        self.hidden_dim = 512
         self.window_sizes = [2, 2]
 
         self.dropout = 0.3
@@ -37,4 +37,4 @@ class Config:
         self.eval_step = 2000
 
         self.coarse_epoches = 5
-        self.fine_epoches = 5
+        self.fine_epoches = 10

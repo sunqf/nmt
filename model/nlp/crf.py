@@ -55,7 +55,7 @@ class Embedding(nn.Module):
                        for embedding, (start, length) in zip(self.gazetteers_embeddings,
                                                              zip(self.gazetteers_index, self.gazetteers_len))]
 
-        output = word_emb + torch.cat([word_emb, *outputs], -1).sum(-1)
+        output = word_emb + torch.cat(outputs, -1).sum(-1)
 
         return PackedSequence(output, batch_sizes)
 
@@ -262,7 +262,7 @@ class BiLSTMCRF(nn.Module):
                                          bidirectional=True, dropout=dropout)
 
         # output layer
-        self.crf = CRFLayer(embedding_dim * 2, num_label, dropout)
+        self.crf = CRFLayer(self.hidden_dim * 2, num_label, dropout)
 
     def _get_features(self, input, gazetteers):
         '''

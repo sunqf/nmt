@@ -178,11 +178,11 @@ class QRNN(nn.Module):
         input_dim = self.input_dim
         layers = []
         for l in range(self.num_layers):
-            layer = QRNNLayer(input_dim, self.hidden_dims, self.window_sizes[l],
+            layer = QRNNLayer(input_dim, self.hidden_dim, self.window_sizes[l],
                               bidirectional=self.bidirectional,
                               dropout=dropout)
             layers.append(layer)
-            input_dim = self.hidden_dims * self.num_directions
+            input_dim = self.hidden_dim * self.num_directions
 
         self.layers = nn.ModuleList(layers)
 
