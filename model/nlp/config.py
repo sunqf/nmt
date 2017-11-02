@@ -6,14 +6,14 @@ class Config:
     def __init__(self):
         self.max_vocab_size = 5000
         self.batch_size = 16
-        self.embedding_dim = 32
+        self.embedding_dim = 64
         self.hidden_mode = 'QRNN'
         self.num_hidden_layer = 2
-        self.hidden_dim = 64
+        self.hidden_dim = 128
         self.window_sizes = [2, 2]
 
         self.dropout = 0.3
-        self.use_cuda = False
+        self.use_cuda = True
 
         self.data_root = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/'
         #self.data_root = '/home/sunqf/Work/chinese_segment/data'
@@ -59,7 +59,7 @@ class MultiTaskConfig:
         self.window_sizes = [2, 2]
 
         self.dropout = 0.3
-        self.use_cuda = False
+        self.use_cuda = True
 
         self.data_root = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/'
         #self.data_root = '/home/sunqf/Work/chinese_segment/data'
@@ -117,4 +117,4 @@ class MultiTaskConfig:
         self.eval_step = 500
 
         self.coarse_epoches = 5
-        self.fine_epoches = 5
+        self.fine_epoches = 10

@@ -308,7 +308,8 @@ class DataLoader:
             assert os.path.exists(path)
             with open(path, 'r') as file:
                 for line in file:
-                    if len(line.strip()) > 0:
+                    line = line.strip()
+                    if len(line) > 0 and len(line) < 300:
                         line = strQ2B(line)
 
                         if self.with_type:
