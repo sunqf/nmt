@@ -291,3 +291,6 @@ class BiLSTMCRF(nn.Module):
         for name, parameter in self.named_parameters():
             if name != 'word_embeds':
                 yield parameter
+
+
+

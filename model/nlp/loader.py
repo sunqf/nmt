@@ -137,10 +137,12 @@ class CharacterAttribute(Converter):
             return np.array([self.char2pinyin.get(data, self.default_pinyin)])
 
     def convert(self, data):
-        return np.concatenate([self.convert_attr(data), self.convert_pinyin(data)], -1)
+        #return np.concatenate([self.convert_attr(data), self.convert_pinyin(data)], -1)
+        return self.convert_attr(data)
 
     def length(self):
-        return len(self.attrs) + len(self.pinyins)
+        #return len(self.attrs) + len(self.pinyins)
+        return len(self.attrs)
 
 
     @staticmethod
@@ -273,7 +275,6 @@ class DataLoader:
         word_counts = collections.defaultdict(int)
         tag_set = set()
         for path in corpus_paths:
-            print(corpus_paths)
             assert os.path.exists(path)
             with open(path, 'r') as file:
                 for line in file:
@@ -337,7 +338,7 @@ class DataLoader:
 
 
     def get_data(self, paths, batch_size):
-        data = list(self.load(paths))
+        data = list(self.load(paths))[0:100]
         data = sorted(data, key=lambda item: len(item[0]), reverse=True)
 
         for start in range(0, len(data), batch_size):

@@ -191,7 +191,7 @@ class SegTrainer:
             self.model.zero_grad()
 
             # Step 2. Run our forward pass.
-            batch_loss = self.model.loss(batch_sentence, batch_gazetteers, batch_tags)
+            batch_loss = self.model.train(batch_sentence, batch_gazetteers, batch_tags)
 
             total_loss += batch_loss.data[0]
 
@@ -218,7 +218,7 @@ class SegTrainer:
                 valid_len = len(self.valid_data)
                 for sentences, gazetteers, tags in self.valid_data:
                     #batch_valid_crf_loss, batch_valid_lm_loss = model.loss(sentences, gazetteers, tags)
-                    batch_valid_crf_loss = self.model.loss(sentences, gazetteers, tags)
+                    batch_valid_crf_loss = self.model.train(sentences, gazetteers, tags)
 
                     valid_crf_loss += batch_valid_crf_loss.data[0]
                     #valid_lm_loss += batch_valid_lm_loss.data[0]
