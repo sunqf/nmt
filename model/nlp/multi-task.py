@@ -152,14 +152,14 @@ class TaggerTask(Task):
 
 class MultiTask:
 
-    def __init__(self, tasks, use_cuda=False):
+    def __init__(self, tasks, task_weights, use_cuda=False):
         super(MultiTask, self).__init__()
 
         self.use_cuda = use_cuda
 
         self.tasks = [t.cuda() if use_cuda else t for t in tasks]
-
-        self.optimizer = torch.optim.Adam(itertools.chain.from_iterable([t.parameters() for t in self.tasks]))
+        self.task_weights = task_weights
+        self.optimizer = torch.optim.Adam(itertools.chain.from_iterable([t.parameters() for t in self.tasks]), lr=2e-3)
 
 
     @staticmethod
@@ -193,7 +193,7 @@ class MultiTask:
                     task_data = self.to_cuda(task_data)
 
                 loss = task.loss(task_data)
-                loss.backward()
+                (loss  * self.task_weights[task_id]).backward()
                 train_losses[task_id] += loss.data[0]
                 task_step_count[task_id] += len(task_data)
 
@@ -204,17 +204,17 @@ class MultiTask:
 
                 if batch_id % eval_step == 0:
 
-                    def print_loss(losses):
-                        print('\t'.join(['%s=%.6f' % (name, loss) for name, loss in losses]))
-                    print('train loss:')
-                    print_loss([(task.name, loss/step_count)
+                    def print_loss(prefix, losses):
+                        print(prefix + '\t' + '\t'.join(['%s=%.6f' % (name, loss) for name, loss in losses]))
+                    print()
+                    print_loss('train loss:', [(task.name, loss/step_count)
                                 for task, loss, step_count in zip(self.tasks, train_losses, task_step_count)])
                     train_losses = [0.] * len(self.tasks)
                     task_step_count = [0] * len(self.tasks)
 
                     valid_losses = self.valid(valid_data)
-                    print('valid loss:')
-                    print_loss(valid_losses)
+                    print()
+                    print_loss('valid loss:', valid_losses)
 
 
                     # sample
@@ -259,6 +259,11 @@ def build(config):
     for counts, tags in word_with_tag:
         word_counts.update(counts)
 
+    task_sizes = [sum(counts.values()) for counts, _ in word_with_tag]
+
+    min_sizes = min(task_sizes)
+    task_weights = [float(min_sizes)/s for s in task_sizes]
+
     vocab = Vocab.build(word_counts, config.max_vocab_size)
     taggers = [BMESTagger(tags) for _, tags in word_with_tag]
 
@@ -270,6 +275,7 @@ def build(config):
     train_data = []
     valid_data = []
     eval_data = []
+
 
     for id, (loader, task) in enumerate(zip(loaders, config.tasks)):
         temp_train, temp_valid = train_test_split(list(loader.get_data(task.train_paths, config.batch_size)),
@@ -292,12 +298,12 @@ def build(config):
     tasks = [TaggerTask(task.name, encoder, vocab, tagger, config.dropout)
              for id, (tagger, task) in enumerate(zip(taggers, config.tasks))]
 
-    return tasks, (train_data, valid_data, eval_data)
+    return tasks, task_weights, (train_data, valid_data, eval_data)
 
 config = MultiTaskConfig()
 
-tasks, (train_data, valid_data, eval_data) = build(config)
+tasks, task_weights, (train_data, valid_data, eval_data) = build(config)
 
-trainer = MultiTask(tasks, config.use_cuda)
+trainer = MultiTask(tasks, task_weights, config.use_cuda)
 print('train stage')
 trainer.train(train_data, valid_data, eval_data, config.epoches, config.eval_step, config.model_prefix)
