@@ -309,7 +309,7 @@ class DataLoader:
             with open(path, 'r') as file:
                 for line in file:
                     line = line.strip()
-                    if len(line) > 0 and len(line) < 300:
+                    if len(line) > 0:
                         line = strQ2B(line)
 
                         if self.with_type:

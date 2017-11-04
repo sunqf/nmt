@@ -51,7 +51,7 @@ class MultiTaskConfig:
 
     def __init__(self):
         self.max_vocab_size = 5000
-        self.batch_size = 16
+        self.batch_size = 32
         self.embedding_dim = 64
         self.hidden_mode = 'QRNN'
         self.num_hidden_layer = 2
@@ -93,6 +93,8 @@ class MultiTaskConfig:
                              True)
 
         self.tasks = [people2014, ctb, msr, pku, nlpcc, ctb_pos]
+
+        self.test_size = 1000//self.batch_size
 
         # 字属性字典
         self.char_attr = './dict/word-type'

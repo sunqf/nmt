@@ -279,7 +279,7 @@ def build(config):
 
     for id, (loader, task) in enumerate(zip(loaders, config.tasks)):
         temp_train, temp_valid = train_test_split(list(loader.get_data(task.train_paths, config.batch_size)),
-                                                  test_size=50)
+                                                  test_size=config.test_size)
 
         train_data += zip([id] * len(temp_train), temp_train)
         valid_data += zip([id] * len(temp_valid), temp_valid)
