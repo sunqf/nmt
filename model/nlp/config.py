@@ -52,29 +52,17 @@ class MultiTaskConfig:
     def __init__(self):
         self.max_vocab_size = 5000
         self.batch_size = 16
-        self.embedding_dim = 64
+        self.embedding_dim = 32
         self.hidden_mode = 'QRNN'
         self.num_hidden_layer = 2
-        self.hidden_dim = 128
+        self.hidden_dim = 64
         self.window_sizes = [2, 2]
 
         self.dropout = 0.3
-        self.use_cuda = True
+        self.use_cuda = False
 
         self.data_root = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/'
         #self.data_root = '/home/sunqf/Work/chinese_segment/data'
-        self.coarse_train_paths = [os.path.join(self.data_root, 'train/train.all')]
-        self.coarse_eval_paths = [os.path.join(self.data_root, 'gold', path)
-                                  for path in ['bosonnlp/auto_comments.txt', 'bosonnlp/food_comments.txt',
-                                        'bosonnlp/news.txt', 'bosonnlp/weibo.txt',
-                                        'ctb.gold', 'msr_test_gold.utf8',
-                                        'pku_test_gold.utf8']]
-
-        #self.fine_train_paths = [os.path.join(self.data_root, 'train/ctb.train')]
-        #self.fine_eval_paths = [os.path.join(self.data_root, 'gold/ctb.gold')]
-
-        self.fine_train_paths = [os.path.join(self.data_root, 'pos/ctb.pos.train')]
-        self.fine_eval_paths = [os.path.join(self.data_root, 'pos/ctb.pos.gold')]
 
         people2014 = TaskConfig('people2014', [os.path.join(self.data_root, 'train/people2014.txt')], [], False)
         ctb = TaskConfig('ctb8',
@@ -112,9 +100,6 @@ class MultiTaskConfig:
         self.wordset = {}
         self.model_prefix = 'model/model'
 
-        self.lm_weight = 0.5
-
         self.eval_step = 500
 
-        self.coarse_epoches = 5
-        self.fine_epoches = 10
+        self.epoches = 10

@@ -5,6 +5,7 @@ from .config import MultiTaskConfig
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 import itertools
+import random
 
 import torch
 import torch.nn as nn
@@ -30,10 +31,10 @@ class Encoder(nn.Module):
 
         if self.hidden_mode == 'QRNN':
 
-            self.hidden_module = QRNN(self.embedding_dim, self.hidden_dim, self.num_hidden_layer,
+            self.hidden_module = QRNN(self.input_embed.output_dim, self.hidden_dim, self.num_hidden_layer,
                                       window_sizes=self.window_sizes, dropout=dropout)
         else:
-            self.hidden_module = nn.LSTM(self.embedding_dim, self.hidden_dim, num_layers=self.num_hidden_layer,
+            self.hidden_module = nn.LSTM(self.input_embed.output_dim, self.hidden_dim, num_layers=self.num_hidden_layer,
                                          bidirectional=True, dropout=dropout)
 
     def forward(self, input, gazetteers):
@@ -151,20 +152,45 @@ class TaggerTask(Task):
 
 class MultiTask:
 
-    def __init__(self, tasks):
+    def __init__(self, tasks, use_cuda=False):
         super(MultiTask, self).__init__()
 
-        self.tasks = tasks
+        self.use_cuda = use_cuda
+
+        self.tasks = [t.cuda() if use_cuda else t for t in tasks]
+
         self.optimizer = torch.optim.Adam(itertools.chain.from_iterable([t.parameters() for t in self.tasks]))
 
+
+    @staticmethod
+    def to_cuda(batch_data):
+        sentences, gazetteers, batch_tags = batch_data
+        return (PackedSequence(sentences.data.cuda(), sentences.batch_sizes),
+                PackedSequence(gazetteers.data.cuda(), gazetteers.batch_sizes),
+                PackedSequence(batch_tags.data.cuda(), batch_tags.batch_sizes))
+
+
+
     def train(self, train_data, valid_data, eval_data, epoch, eval_step, model_prefix):
+
+        # put valid_data, eval_data to gpu.   put train_data to gpu lazily
+        if self.use_cuda:
+            valid_data = [(task_id, self.to_cuda(batch_data)) for task_id, batch_data in valid_data]
+            eval_data = [(task_id, [self.to_cuda(batch) for batch in task_data])
+                         for task_id, task_data in eval_data]
+
         for epoch in tqdm(range(epoch), desc='epoch', total=epoch):
             train_losses = [0.] * len(self.tasks)
             task_step_count = [0] * len(self.tasks)
-            for batch_id, (task_id, task_data) in tqdm(enumerate(train_data, start=1), desc='batch', total=len(train_data)):
+            for batch_id, (task_id, task_data) in tqdm(enumerate(train_data, start=1),
+                                                       desc='batch',
+                                                       total=len(train_data)):
                 task = self.tasks[task_id]
                 task.train()
                 task.zero_grad()
+
+                if self.use_cuda:
+                    task_data = self.to_cuda(task_data)
 
                 loss = task.loss(task_data)
                 loss.backward()
@@ -182,7 +208,7 @@ class MultiTask:
                         print('\t'.join(['%s=%.6f' % (name, loss) for name, loss in losses]))
                     print('train loss:')
                     print_loss([(task.name, loss/step_count)
-                                         for task, loss, step_count in zip(self.tasks, train_losses, task_step_count)])
+                                for task, loss, step_count in zip(self.tasks, train_losses, task_step_count)])
                     train_losses = [0.] * len(self.tasks)
                     task_step_count = [0] * len(self.tasks)
 
@@ -196,7 +222,8 @@ class MultiTask:
 
             self.sample(eval_data)
             print('eval:')
-            print('\n'.join([self.tasks[task_id].evaluation(task_data) for task_id, task_data in eval_data]))
+            print('\n'.join([self.tasks[task_id].evaluation(task_data)
+                             for task_id, task_data in eval_data]))
 
             for task in self.tasks:
                 with open('%s.%s.%d' % (model_prefix, task.name, epoch), 'wb') as f:
@@ -206,13 +233,14 @@ class MultiTask:
         losses = [0.] * len(self.tasks)
         counts = [0] * len(self.tasks)
         for task_id, task_data in data:
-            losses[task_id] += self.tasks[task_id].train(task_data)
+            task = self.tasks[task_id]
+            task.eval()
+            losses[task_id] += task.loss(task_data).data[0]
             counts[task_id] += len(task_data)
 
         return [(task.name, loss/count) for task, loss, count in zip(self.tasks, losses, counts)]
 
     def sample(self, data):
-        import random
         print('sample:')
         for task_id, task_data in data:
             if len(task_data) > 0:
@@ -245,7 +273,8 @@ def build(config):
 
     for id, (loader, task) in enumerate(zip(loaders, config.tasks)):
         temp_train, temp_valid = train_test_split(list(loader.get_data(task.train_paths, config.batch_size)),
-                                                  test_size=0.2)
+                                                  test_size=50)
+
         train_data += zip([id] * len(temp_train), temp_train)
         valid_data += zip([id] * len(temp_valid), temp_valid)
 
@@ -253,22 +282,8 @@ def build(config):
         if len(temp_eval) > 0:
             eval_data.append((id, temp_eval))
 
-    import random
     random.shuffle(train_data)
     random.shuffle(valid_data)
-
-    def to_cuda(batch_data):
-        sentences, gazetteers, batch_tags = batch_data
-        return (PackedSequence(sentences.data.cuda(), sentences.batch_sizes),
-                PackedSequence(gazetteers.data.cuda(), gazetteers.batch_sizes),
-                PackedSequence(batch_tags.data.cuda(), batch_tags.batch_sizes))
-
-
-    if config.use_cuda:
-        train_data = [(task_id, to_cuda(batch_data)) for task_id, batch_data in train_data]
-        valid_data = [(task_id, to_cuda(batch_data)) for task_id, batch_data in valid_data]
-
-        eval_data = [(task_id, [to_cuda(batch) for batch in task_data])for task_id, task_data in eval_data]
 
     encoder = Encoder(len(vocab), gazetteers, config.embedding_dim,
                       config.hidden_mode, config.hidden_dim, config.num_hidden_layer, config.window_sizes,
@@ -277,16 +292,12 @@ def build(config):
     tasks = [TaggerTask(task.name, encoder, vocab, tagger, config.dropout)
              for id, (tagger, task) in enumerate(zip(taggers, config.tasks))]
 
-
-    if config.use_cuda:
-        tasks = [t.cuda() for t in tasks]
-
     return tasks, (train_data, valid_data, eval_data)
 
 config = MultiTaskConfig()
 
 tasks, (train_data, valid_data, eval_data) = build(config)
 
-trainer = MultiTask(tasks)
+trainer = MultiTask(tasks, config.use_cuda)
 print('train stage')
-trainer.train(train_data, valid_data, eval_data, config.fine_epoches, config.eval_step, config.model_prefix)
+trainer.train(train_data, valid_data, eval_data, config.epoches, config.eval_step, config.model_prefix)
