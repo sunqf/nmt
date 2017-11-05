@@ -339,7 +339,7 @@ class DataLoader:
 
 
     def get_data(self, paths, batch_size):
-        data = list(self.load(paths))[0:10000]
+        data = list(self.load(paths))[0:20000]
         data = sorted(data, key=lambda item: len(item[0]), reverse=True)
 
         for start in range(0, len(data), batch_size):

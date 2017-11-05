@@ -44,16 +44,34 @@ class Config:
         self.fine_epoches = 5
 
 
-TaskConfig = collections.namedtuple('TaskConfig', ['name', 'train_paths', 'eval_paths', 'with_type'])
+class TaggerConfig:
+
+    def __init__(self,
+                 name,
+                 train_paths, eval_paths, with_type,
+                 hidden_model='QRNN', hidden_dim=64, window_sizes=[2,2],
+                 bidirectional=True,
+                 dropout=0.3):
+        self.name = name
+        self.train_paths = train_paths
+        self.eval_paths = eval_paths
+        self.with_type = with_type
+
+        self.hidden_model = hidden_model
+        self.hidden_dim = hidden_dim
+        self.window_sizes = window_sizes
+        self.bidirectional = bidirectional
+        self.dropout = dropout
+
 
 class MultiTaskConfig:
 
     def __init__(self):
         self.max_vocab_size = 5000
         self.batch_size = 32
-        self.embedding_dim = 64
+        self.embedding_dim = 128
         self.hidden_mode = 'QRNN'
-        self.num_hidden_layer = 2
+        self.num_hidden_layer = 1
         self.hidden_dim = 128
         self.window_sizes = [2, 2]
 
@@ -63,33 +81,33 @@ class MultiTaskConfig:
         self.data_root = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/'
         #self.data_root = '/home/sunqf/Work/chinese_segment/data'
 
-        people2014 = TaskConfig('people2014', [os.path.join(self.data_root, 'train/people2014.txt')], [], False)
-        ctb = TaskConfig('ctb8',
-                         [os.path.join(self.data_root, 'train/ctb.train')],
-                         [os.path.join(self.data_root, 'gold/ctb.gold')],
-                         False)
-        msr = TaskConfig('msr',
-                         [os.path.join(self.data_root, 'train/msr_training.utf8')],
-                         [os.path.join(self.data_root, 'gold/msr_test_gold.utf8')],
-                         False)
-
-        pku = TaskConfig('pku',
-                         [os.path.join(self.data_root, 'train/pku_training.utf8')],
-                         [os.path.join(self.data_root, 'gold/pku_test_gold.utf8')],
-                         False)
-
-        nlpcc = TaskConfig('nlpcc',
-                           [os.path.join(self.data_root, 'train/nlpcc2016-word-seg-train.dat'),
-                                   os.path.join(self.data_root, 'train/nlpcc2016-wordseg-dev.dat')],
-                           #[os.path.join(self.data_root, 'gold/nlpcc2016-wordseg-test.dat')],
-                           [],
+        people2014 = TaggerConfig('people2014', [os.path.join(self.data_root, 'train/people2014.txt')], [], False)
+        ctb = TaggerConfig('ctb8',
+                           [os.path.join(self.data_root, 'train/ctb.train')],
+                           [os.path.join(self.data_root, 'gold/ctb.gold')],
+                           False)
+        msr = TaggerConfig('msr',
+                           [os.path.join(self.data_root, 'train/msr_training.utf8')],
+                           [os.path.join(self.data_root, 'gold/msr_test_gold.utf8')],
                            False)
 
+        pku = TaggerConfig('pku',
+                           [os.path.join(self.data_root, 'train/pku_training.utf8')],
+                           [os.path.join(self.data_root, 'gold/pku_test_gold.utf8')],
+                           False)
 
-        ctb_pos = TaskConfig('ctb_pos',
-                             [os.path.join(self.data_root, 'pos/ctb.pos.train')],
-                             [os.path.join(self.data_root, 'pos/ctb.pos.gold')],
-                             True)
+        nlpcc = TaggerConfig('nlpcc',
+                             [os.path.join(self.data_root, 'train/nlpcc2016-word-seg-train.dat'),
+                                   os.path.join(self.data_root, 'train/nlpcc2016-wordseg-dev.dat')],
+                             #[os.path.join(self.data_root, 'gold/nlpcc2016-wordseg-test.dat')],
+                             [],
+                             False)
+
+
+        ctb_pos = TaggerConfig('ctb_pos',
+                               [os.path.join(self.data_root, 'pos/ctb.pos.train')],
+                               [os.path.join(self.data_root, 'pos/ctb.pos.gold')],
+                               True)
 
         self.tasks = [people2014, ctb, msr, pku, nlpcc, ctb_pos]
 
