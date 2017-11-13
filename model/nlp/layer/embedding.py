@@ -1,11 +1,6 @@
 
 
-from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence, PackedSequence
-from torch.autograd import Variable
-
-from sklearn.model_selection import train_test_split
-from torch.optim.lr_scheduler import StepLR
-import itertools
+from torch.nn.utils.rnn import PackedSequence
 
 
 import torch

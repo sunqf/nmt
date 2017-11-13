@@ -240,6 +240,7 @@ class MultiTask:
                 result = self.tasks[task_id].evaluation(task_data)
                 print('%s\t%s' % (self.tasks[task_id].name,
                                   '\t'.join(["%s=%0.6f" % (k, v)for k, v in result.items()])))
+            print('\n\n')
 
             for task in self.tasks:
                 with open('%s.%s.%d' % (model_prefix, task.name, epoch), 'wb') as f:

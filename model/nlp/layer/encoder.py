@@ -1,19 +1,8 @@
 
-
-from .crf import CRFLayer
-from .loader import Vocab, BMESTagger, CharacterAttribute, Gazetteer, DataLoader
-from .config2 import MultiTaskConfig
-from sklearn.model_selection import train_test_split
-from tqdm import tqdm
-import itertools
-import random
-
-import torch
 import torch.nn as nn
-from torch.nn import Embedding
+from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence, PackedSequence
+from .embedding import Embedding
 from .qrnn import QRNN
-from torch.nn.utils.rnn import pad_packed_sequence, PackedSequence
-from .crf import Embedding
 
 class Encoder(nn.Module):
     def __init__(self, vocab_size, gazetteers, embedding_dim, hidden_mode, hidden_dim, num_hidden_layer=1,
