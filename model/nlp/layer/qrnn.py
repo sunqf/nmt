@@ -170,7 +170,7 @@ class QRNN(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
 
-        self.window_sizes = window_sizes
+        self.window_sizes = [window_sizes] * num_layers if isinstance(window_sizes, int) else window_sizes
 
         self.bidirectional = bidirectional
         self.num_direction = 2 if bidirectional else 1

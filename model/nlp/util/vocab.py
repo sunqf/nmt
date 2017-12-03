@@ -20,13 +20,13 @@ class Vocab(Converter):
         self.padding_idx = 0
         self.unk_idx = 1
         self.eos = 2
-        self.word2ids = {word: id for id, word in enumerate(self.words)}
-        self.id2words = {id: word for id, word in enumerate(self.words)}
+        self.word2indexes = {word: index for index, word in enumerate(self.words)}
+        self.index2words = {index: word for index, word in enumerate(self.words)}
 
     def __len__(self):
-        return len(self.word2ids)
+        return len(self.word2indexes)
 
-    def getPaddingIdx(self):
+    def getPaddingIndex(self):
         return self.padding_idx
 
     def getUnkIdx(self):
@@ -37,18 +37,18 @@ class Vocab(Converter):
 
     def convert(self, data):
         if isinstance(data, Iterable):
-            return np.array([np.array([self.word2ids.get(word, self.unk_idx)]) for word in data])
+            return np.array([np.array([self.word2indexes.get(word, self.unk_idx)]) for word in data])
         else:
-            return np.array([self.word2ids.get(data, self.unk_idx)])
+            return np.array([self.word2indexes.get(data, self.unk_idx)])
 
     def length(self):
         return 1
 
     def get_word(self, data):
         if isinstance(data, Iterable):
-            return [self.id2words.get(id, 'unk') for id in data]
+            return [self.index2words.get(index, 'unk') for index in data]
         else:
-            return self.id2words.get(id, 'unk')
+            return self.index2words.get(data, 'unk')
 
     @staticmethod
     def build(word_counts, vocab_size):
@@ -155,3 +155,4 @@ class Gazetteer(Converter):
                     length2words[len(word)].add(word)
 
             return Gazetteer(name, length2words)
+

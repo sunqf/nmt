@@ -11,23 +11,27 @@ class Task(nn.Module):
     def __init__(self):
         super(Task, self).__init__()
 
-    def loss(self, encoder, data):
+    def loss(self, batch_data, use_cuda=False):
         pass
 
-    def evaluation(self, encoder, data):
+    def evaluation(self, data, use_cuda=False):
         pass
 
-    def sample(self, encoder, data):
+    def sample(self, batch_data, use_cuda=False):
         pass
 
 
-class DataSet:
+class Loader:
 
-    def word_counts(self):
+    def batch_train(self, vocab, gazetters, batch_size):
         pass
 
-    def train_batch(self, transformer, batch_size):
+    def batch_test(self, vocab, gazetters, batch_size):
         pass
 
-    def test_batch(self, transformer, batch_size):
+class TaskConfig:
+    def loader(self):
+        pass
+
+    def create_task(self, shared_vocab, shared_encoder):
         pass

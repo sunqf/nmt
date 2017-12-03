@@ -192,32 +192,6 @@ class BIETagger:
     def is_split(self, id):
         return id == 2
 
-class BMESTagger:
-    def __init__(self, tag_set):
-        self.id2tag = [tag for tag in tag_set]
-        self.tag2id = dict([(tag,i) for i, tag in enumerate(tag_set)])
-        self.split_ids = set([id for tag, id in self.tag2id.items() if tag.startswith('E_') or tag.startswith('S_')])
-
-    def __len__(self):
-        return len(self.tag2id)
-
-    @staticmethod
-    def tag(word, tagType=''):
-        if len(word) == 1:
-            return ['S_' + tagType]
-        elif len(word) == 2:
-            return ['B_' + tagType, 'E_' + tagType]
-        else:
-            return ['B_' + tagType] + ['M_' + tagType] * (len(word) - 2) + ['E_' + tagType]
-
-    def getId(self, tag):
-        return self.tag2id[tag]
-
-    def get_tag(self, id):
-        return self.id2tag[id]
-
-    def is_split(self, id):
-        return id in self.split_ids
 
 
 def strQ2B(ustring):

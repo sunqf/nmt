@@ -63,6 +63,21 @@ class Tree:
             else:
                 return Node(type, None, children)
 
+    def to_line(self):
+
+        def dfs(node):
+            text = ''
+            if len(node.children) > 0:
+                text += '(%s' % node.type
+                for child in node.children:
+                    text += ' ' + dfs(child)
+                text += ')'
+            else:
+                text += '(%s %s)' % (node.type, node.value)
+
+            return text
+        return '(' + dfs(self.root.children[0]) + ')'
+
     def shift_reduce(self):
         words = []
         actions = []
@@ -88,6 +103,31 @@ class Tree:
 
         return words, actions
 
+    # http://aclweb.org/anthology/P/P13/P13-1013.pdf
+    def shift_reduce2(self):
+        words = []
+        actions = []
+        def dfs(node):
+            if len(node.children) > 0:
+                sub = node.children[0]
+                dfs(sub)
+                for sub in node.children[1:]:
+                    dfs(sub)
+                    actions.append('reduce')
+            else:
+                # 字模型
+                chars = utils.replace_entity(node.value)
+                _, char = chars[0]
+                words.append(char)
+                actions.append('shift')
+                for type, char in chars[1:]:
+                    words.append(char)
+                    actions.append('shift')
+                    actions.append('reduce')
+
+        dfs(self.root)
+
+        return words, actions
 
 
 gold_files = [
@@ -132,9 +172,11 @@ with open('ctb.parser.train', 'w') as train, open('ctb.parser.gold', 'w') as gol
                 try:
                     if len(s) > 0:
                         tree = Tree(s)
+                        '''
                         words, transitions = tree.shift_reduce()
                         sr_texts.append(' '.join(words) + '\t\t' + ' '.join(transitions))
-
+                        '''
+                        sr_texts.append(tree.to_line())
                 except StopIteration:
                     print(s)
 

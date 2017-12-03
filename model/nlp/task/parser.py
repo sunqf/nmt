@@ -7,7 +7,7 @@ import itertools
 from ..layer.encoder import Encoder
 from ..layer.qrnn import QRNN
 from ..layer.crf import CRFLayer
-from .task import Task, DataSet
+from .task import Task, Loader
 from torch.nn.utils.rnn import pad_packed_sequence, PackedSequence, pack_padded_sequence
 from ..util.vocab import Vocab, CharacterAttribute, Gazetteer
 from sklearn.model_selection import train_test_split
@@ -313,6 +313,69 @@ class SPINN(nn.Module):
 
         return bundle([stack.pop() for stack in stacks])[0], trans_loss/trans_count, trans_correct, trans_count
 
+
+    def range_loss(self, sentences, gold_actions, begin, end):
+        '''
+        :param sentences: [length, batch, dim]
+        :param gold_actions: [length, batch]
+        :return:
+        '''
+
+        State = namedtuple('State', ['buffer', 'stack', 'contexts', 'gold_actions'])
+
+        buffers, lengths = self._buffer(sentences)
+
+        # [batch_size * [stack_size * [node]]]
+        stacks = [[self.stack_base, self.stack_base]] * len(lengths)
+        contexts = [[self.context_begin]] * len(lengths)
+        num_action = gold_actions.size(0)
+
+        trans_loss = Variable(torch.FloatTensor([0]))
+        trans_correct = 0
+        trans_count = 0
+
+
+        for t in range(min(num_action, end)):
+            buffer_t, stack_t, action_t, context_t = [], [], [], []
+            for buf, stack, action, context in zip(buffers, stacks, gold_actions[t].data, contexts):
+                if action == Action.SHIFT or action == Action.REDUCE:
+                    buffer_t.append(buf)
+                    stack_t.append(stack)
+                    action_t.append(action)
+                    context_t.append(context)
+
+            context_t_output, trans_hyp = self.contexter(buffer_t, stack_t, context_t)
+
+            action_t = Variable(torch.LongTensor(action_t), requires_grad=False)
+
+            if t >= begin:
+                trans_loss += F.cross_entropy(trans_hyp,
+                                              action_t,
+                                              size_average=False,
+                                              ignore_index=Action.NONE)
+                trans_pred = trans_hyp.max(1)[1]
+                trans_correct += (trans_pred.data == action_t.data).sum()
+                trans_count += action_t.nelement()
+
+            reducing_lefts, reducing_rights, reducing_stacks, reducing_contexts = [], [], [], []
+            for buf, stack, action, context, context_output in zip(buffer_t, stack_t, action_t.data, context_t, context_t_output):
+                context.append(context_output)
+                if action == Action.SHIFT:
+                    stack.append(buf.pop())
+                elif action == Action.REDUCE:
+                    reducing_rights.append(stack.pop())
+                    reducing_lefts.append(stack.pop())
+                    reducing_contexts.append(context_output)
+                    reducing_stacks.append(stack)
+
+
+            if reducing_rights:
+                reduceds = iter(self.reduce(reducing_lefts, reducing_rights, reducing_contexts))
+                for reduced, stack in zip(reduceds, reducing_stacks):
+                    stack.append(reduced)
+
+        return trans_loss/trans_count, trans_correct, trans_count
+
     def check(self, actions, next, sentence_length):
 
         shift_count = sum(1 for a in actions if a == Action.SHIFT)
@@ -328,7 +391,7 @@ class SPINN(nn.Module):
         ParseState = namedtuple('ParseState', ['buffer', 'stack', 'contexts', 'actions', 'score'])
         sen_len = sentence.size(0)
         max_action = sen_len * 2 - 1
-        buffer = list(sentence.split(1, 0))
+        buffer = list(self.projection(sentence).split(1, 0))
         buffer.append(self.sentence_end)
         topk = [ParseState(list(reversed(buffer)), [self.stack_base, self.stack_base], [self.context_begin], [], 0.0)]
 
@@ -341,21 +404,22 @@ class SPINN(nn.Module):
 
             context_output, action_hyp = self.contexter(buffer_t, stack_t, context_t)
 
-            action_hyp = F.log_softmax(action_hyp).split(1, 0)
+            action_prob = F.log_softmax(action_hyp).split(1, 0)
 
-            all = [(state, action, state.score+probs[0, action].data[0])
-                   for action in [Action.SHIFT, Action.REDUCE] for state, probs in zip(topk, action_hyp)]
+            all = [(state, context, action, state.score+probs[0, action].data[0])
+                   for action in [Action.SHIFT, Action.REDUCE] for state, context, probs in zip(topk, context_output, action_prob)]
 
-            sort_res = sorted(all, key=lambda i: i[2], reverse=True)
+            sort_res = sorted(all, key=lambda i: i[3], reverse=True)
 
             topk = []
             reducing_left, reducing_right, reducing_context, reducing_stack = [], [], [], []
-            for state, action, score in sort_res:
+            for state, context, action, score in sort_res:
                 if self.check(state.actions, action, sen_len):
                     buffer = state.buffer.copy()
                     stack = state.stack.copy()
                     contexts = state.contexts.copy()
                     actions = state.actions.copy()
+                    contexts.append(context)
                     actions.append(action)
 
                     if action == Action.SHIFT:
@@ -405,20 +469,22 @@ class ParserTask(Task):
                        #{'params': self.task_encoder.parameters(), 'weight_decay': task_weight_decay},
                        {'params': self.spinn.parameters(), 'weight_decay': task_weight_decay}]
 
-    def forward(self, sentences, transitions):
+    def forward(self, sentences, actions):
         sentences, gazetteers = sentences
 
         feature = self.general_encoder(sentences, gazetteers)
-        return self.spinn.loss(feature, transitions)
+        return self.spinn.loss(feature, actions)
 
-    def loss(self, sentences, transitions):
+    def loss(self, sentences, actions):
 
-        root, loss, acc, count = self.forward(sentences, transitions)
+        root, loss, acc, count = self.forward(sentences, actions)
 
         return loss, acc, count
 
-    def evaluation(self, sentences, transtions):
-
+    def range_loss(self, sentences, actions, begin, end):
+        sentences, gazetteers = sentences
+        feature = self.general_encoder(sentences, gazetteers)
+        return self.spinn.range_loss(feature, actions, begin, end)
 
     def parse(self, sentences):
         sentences, gazetteers = sentences
@@ -469,7 +535,7 @@ class ParserTask(Task):
 
 
 
-class CTBParser(DataSet):
+class CTBParser(Loader):
     def __init__(self, train_paths, test_paths):
         self.train_data, self.word_counts, self.test_data = self.load(train_paths, test_paths)
 
@@ -602,8 +668,8 @@ class MultiTaskConfig:
         '''
 
         self.ctb_parser = ParserConfig('ctb_parser',
-                                  [os.path.join(self.data_root, 'parser/ctb.parser.word.train')],
-                                  [os.path.join(self.data_root, 'parser/ctb.parser.word.gold')])
+                                  [os.path.join(self.data_root, 'parser/ctb.parser.train')],
+                                  [os.path.join(self.data_root, 'parser/ctb.parser.gold')])
 
         self.tasks = [self.ctb_parser]
 
@@ -651,18 +717,21 @@ for epoch in range(10):
     total_loss = 0.
     total_correct = 0.
     total_count = 0
+
+    seq_step = 50
     for batch_id, batch in enumerate(train_data, start=1):
-        task.train()
-        task.zero_grad()
-
         sentences, transitions = batch
-        loss, correct, count = task.loss(sentences, transitions)
-        total_loss += loss.data[0] * count
-        total_correct += correct
-        total_count += count
+        for begin in range(0, transitions.size(0), seq_step):
+            task.train()
+            task.zero_grad()
 
-        loss.backward()
-        optimzer.step()
+            loss, correct, count = task.range_loss(sentences, transitions, begin, begin+seq_step)
+            total_loss += loss.data[0] * count
+            total_correct += correct
+            total_count += count
+
+            loss.backward()
+            optimzer.step()
 
         if batch_id % 200 == 0:
             valid_loss = 0.

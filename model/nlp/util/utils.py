@@ -63,27 +63,28 @@ def replace_entity(text):
     text = split_hanzi(strQ2B(text))
     return list(itertools.chain.from_iterable([replace_word(word) for word in text.split()]))
 
+# todo use yield
 def replace_word(word, split_word=True):
     if hanzi.fullmatch(word):
-        return [('@zh_char', word)]
+        return [('@zh_char@', word)]
     elif email.fullmatch(word):
-        return [('@email', word)]
+        return [('@email@', word)]
     elif url.fullmatch(word):
-        return [('@url', word)]
+        return [('@url@', word)]
     elif date.fullmatch(word):
-        return [('@date', word)]
+        return [('@date@', word)]
     elif english.fullmatch(word):
-        return [('@eng_word', word)]
+        return [('@eng_word@', word)]
     elif precent.fullmatch(word):
-        return [('precent', word)]
+        return [('@precent@', word)]
     elif numeric.fullmatch(word) or integer.fullmatch(word):
-        return [('@numeric', word)]
+        return [('@numeric@', word)]
     elif numeric_english.fullmatch(word):
-        return [('@numeric_english', word)]
+        return [('@numeric_english@', word)]
     elif split_word:
         return list(itertools.chain.from_iterable(
             [replace_word(sub, False) for sub in symbols.sub(r' \1 ', word).split()]))
     else:
-        return [('@unk', word)]
+        return [('@unk@', word)]
 
 
