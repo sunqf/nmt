@@ -65,7 +65,7 @@ def replace_entity(text):
 
 # todo use yield
 def replace_word(word, split_word=True):
-    if hanzi.fullmatch(word):
+    if hanzi.fullmatch(word) or symbols.fullmatch(word):
         return [('@zh_char@', word)]
     elif email.fullmatch(word):
         return [('@email@', word)]

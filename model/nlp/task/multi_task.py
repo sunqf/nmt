@@ -1,23 +1,11 @@
 import torch
-from torch import nn
-from torch.nn import functional as F
-from torch.autograd import Variable
-from collections import defaultdict, namedtuple, deque
-import itertools
+
 from ..layer.encoder import Encoder
-from ..layer.qrnn import QRNN
-from ..layer.crf import CRFLayer
-from .task import Task, Loader
-from .parser2 import CTBParseData, ParserConfig, ParserTask
+from .parser3 import ParserConfig
 from .tagger import TaggerConfig
-from torch.nn.utils.rnn import pad_packed_sequence, PackedSequence, pack_padded_sequence
 from ..util.vocab import Vocab, CharacterAttribute, Gazetteer
-from ..util.utils import replace_entity
 from sklearn.model_selection import train_test_split
 
-import copy
-
-import numpy as np
 import random
 from tqdm import tqdm
 
@@ -124,7 +112,7 @@ class EncoderConfig:
 class MultiTaskConfig:
     def __init__(self):
         self.encoder_config = EncoderConfig()
-        self.batch_size = 16
+        self.batch_size = 32
         self.data_root = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/'
         # self.data_root = '/home/sunqf/Work/chinese_segment/data'
 
@@ -164,8 +152,8 @@ class MultiTaskConfig:
                                          [os.path.join(self.data_root, 'parser/ctb.dep.gold')])
 
         self.task_configs = [# people2014,
-                             ctb, msr, pku, nlpcc,
-                             ctb_pos, ctb_parser_config]
+                             ctb, msr, pku, nlpcc, ctb_pos,
+                             ctb_parser_config]
 
         self.valid_size = 1000 // self.batch_size
 

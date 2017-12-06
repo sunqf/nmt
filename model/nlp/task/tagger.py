@@ -194,9 +194,8 @@ class TaggerLoader(Loader):
             batch_tags = torch.LongTensor(max_sen_len, len(batch)).fill_(-1)
             for id, (words, tags) in enumerate(batch):
                 sen_len = len(words)
-                batch_sen[:sen_len, id] = torch.from_numpy(vocab.convert(words))
-                batch_gazetteers[0:sen_len, id] = torch.from_numpy(
-                    np.concatenate([gazetteer.convert(words) for gazetteer in gazetteers], -1))
+                batch_sen[:sen_len, id] = torch.LongTensor(vocab.convert(words))
+                batch_gazetteers[0:sen_len, id] = torch.cat([torch.FloatTensor(gazetteer.convert(words)) for gazetteer in gazetteers], -1)
                 batch_tags[:sen_len, id] = torch.LongTensor([self.tagger.getId(tag) for tag in tags])
 
             yield ((pack_padded_sequence(Variable(batch_sen), lens),

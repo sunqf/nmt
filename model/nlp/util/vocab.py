@@ -1,6 +1,5 @@
 
 from collections import namedtuple, Iterable, defaultdict
-import numpy as np
 
 class Converter:
 
@@ -11,23 +10,22 @@ class Converter:
         pass
 
 class Vocab(Converter):
-    def __init__(self, words):
-        self.words = words
+    def __init__(self, words, unk='UNK'):
+        if isinstance(words, list):
+            self.words = words
+        else:
+            self.words = list(words)
 
-        self.words.insert(0, 'padding')
-        self.words.insert(1, 'unk')
-        self.words.insert(2, 'eos')
-        self.padding_idx = 0
-        self.unk_idx = 1
-        self.eos = 2
+        if unk is not None:
+            self.words.insert(0, unk)
+            self.unk_idx = 0
+        else:
+            self.unk_idx = -1
         self.word2indexes = {word: index for index, word in enumerate(self.words)}
         self.index2words = {index: word for index, word in enumerate(self.words)}
 
     def __len__(self):
         return len(self.word2indexes)
-
-    def getPaddingIndex(self):
-        return self.padding_idx
 
     def getUnkIdx(self):
         return self.unk_idx
@@ -37,9 +35,9 @@ class Vocab(Converter):
 
     def convert(self, data):
         if isinstance(data, Iterable):
-            return np.array([np.array([self.word2indexes.get(word, self.unk_idx)]) for word in data])
+            return [self.word2indexes.get(word, self.unk_idx) for word in data]
         else:
-            return np.array([self.word2indexes.get(data, self.unk_idx)])
+            return self.word2indexes.get(data, self.unk_idx)
 
     def length(self):
         return 1
@@ -56,7 +54,7 @@ class Vocab(Converter):
             word_counts = sorted(word_counts.items(), key=lambda item: item[1], reverse=True)[:vocab_size]
         else: word_counts = word_counts.items()
 
-        return Vocab(list([word for word, count in word_counts]))
+        return Vocab([word for word, count in word_counts])
 
 
 CharInfo = namedtuple("CharInfo", ["word", "pinyins", "attrs"])
@@ -69,26 +67,26 @@ class CharacterAttribute(Converter):
         self.attr2id = dict([(id, attr) for id, attr in enumerate(attrs)])
         self.pinyin2id = dict([(id, vowel) for id, vowel in enumerate(pinyins)])
         self.char2attr = defaultdict()
-        self.default_attr = np.array([0] * len(self.attrs))
+        self.default_attr = [0] * len(self.attrs)
         self.char2pinyin = defaultdict()
-        self.default_pinyin = np.array([0] * len(self.pinyins))
+        self.default_pinyin = [0] * len(self.pinyins)
 
         print('pinyin', len(self.pinyins))
         for word, info in char2info.items():
-            self.char2attr[word] = np.array([1 if a in info.attrs else 0 for a in self.attrs])
-            self.char2pinyin[word] = np.array([1 if p in info.pinyins else 0 for p in self.pinyins])
+            self.char2attr[word] = [1 if a in info.attrs else 0 for a in self.attrs]
+            self.char2pinyin[word] = [1 if p in info.pinyins else 0 for p in self.pinyins]
 
     def convert_attr(self, data):
         if isinstance(data, Iterable):
-            return np.array([self.char2attr.get(c, self.default_attr) for c in data])
+            return [self.char2attr.get(c, self.default_attr) for c in data]
         else:
-            return np.array([self.char2attr.get(data, self.default_attr)])
+            return self.char2attr.get(data, self.default_attr)
 
     def convert_pinyin(self, data):
         if isinstance(data, Iterable):
-            return np.array([self.char2pinyin.get(c, self.default_pinyin) for c in data])
+            return [self.char2pinyin.get(c, self.default_pinyin) for c in data]
         else:
-            return np.array([self.char2pinyin.get(data, self.default_pinyin)])
+            return self.char2pinyin.get(data, self.default_pinyin)
 
     def convert(self, data):
         #return np.concatenate([self.convert_attr(data), self.convert_pinyin(data)], -1)
@@ -128,7 +126,7 @@ class Gazetteer(Converter):
 
     def convert(self, sequence):
 
-        res = np.zeros([len(sequence), self.max_len], dtype=np.float)
+        res = [[0] * self.max_len] * len(sequence)
 
         for len in range(1, self.max_len + 1):
             wordset = self.length2words[len]
@@ -136,7 +134,7 @@ class Gazetteer(Converter):
                 word = sequence[start:start+len]
                 if word in wordset:
                     for i in range(len):
-                        res[start+i, i] = 1
+                        res[start+i][i] = 1
 
         return res
 
