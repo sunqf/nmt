@@ -20,7 +20,7 @@ class MultiTask:
         self.tasks = [t.cuda() if use_cuda else t for t in tasks]
         self.task_weights = task_weights
 
-        self.optimizers = [torch.optim.Adam(t.params, lr=2e-3) for t in self.tasks]
+        self.optimizers = [torch.optim.Adam(t.params, lr=1e-3) for t in self.tasks]
 
 
     def train(self, train_data, valid_data, eval_data, epoch, eval_step, model_prefix):
@@ -148,11 +148,11 @@ class MultiTaskConfig:
                                True)
 
         ctb_parser_config = ParserConfig('ctb_parser',
-                                         [os.path.join(self.data_root, 'parser/ctb.dep.train')],
-                                         [os.path.join(self.data_root, 'parser/ctb.dep.gold')])
+                                         [os.path.join(self.data_root, 'parser/ctb.ud.train')],
+                                         [os.path.join(self.data_root, 'parser/ctb.ud.gold')])
 
         self.task_configs = [# people2014,
-                             ctb, msr, pku, nlpcc, ctb_pos,
+                             #ctb, msr, pku, nlpcc, ctb_pos,
                              ctb_parser_config]
 
         self.valid_size = 1000 // self.batch_size
