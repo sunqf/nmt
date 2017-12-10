@@ -1,7 +1,7 @@
 import torch
 
 from ..layer.encoder import Encoder
-from .parser3 import ParserConfig
+from .parser3 import ParserConfig, SelfParserConfig
 from .tagger import TaggerConfig
 from ..util.vocab import Vocab, CharacterAttribute, Gazetteer
 from sklearn.model_selection import train_test_split
@@ -101,7 +101,7 @@ class EncoderConfig:
     def __init__(self):
         self.max_vocab_size = 5000
         self.embedding_dim = 128
-        self.hidden_mode = 'QRNN'
+        self.hidden_mode = 'LSTM'
         self.num_hidden_layer = 1
         self.hidden_dim = 128
         self.window_sizes = [2, 2]
@@ -112,7 +112,7 @@ class EncoderConfig:
 class MultiTaskConfig:
     def __init__(self):
         self.encoder_config = EncoderConfig()
-        self.batch_size = 32
+        self.batch_size = 2
         self.data_root = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/'
         # self.data_root = '/home/sunqf/Work/chinese_segment/data'
 
@@ -151,9 +151,14 @@ class MultiTaskConfig:
                                          [os.path.join(self.data_root, 'parser/ctb.ud.train')],
                                          [os.path.join(self.data_root, 'parser/ctb.ud.gold')])
 
+        self_parser_config = SelfParserConfig('self_parser',
+                                              ['/Users/sunqf/startup/corpus/en-zh/train.zh'],
+                                              ['/Users/sunqf/startup/corpus/wiki_zh_ja/dev.zh'])
         self.task_configs = [# people2014,
                              #ctb, msr, pku, nlpcc, ctb_pos,
-                             ctb_parser_config]
+                             #ctb_parser_config,
+                             self_parser_config
+        ]
 
         self.valid_size = 1000 // self.batch_size
 

@@ -164,8 +164,6 @@ class UDTree:
 
     def linearize(self):
         chars = list(itertools.chain.from_iterable([node.chars for node in self.nodes]))
-        relations = [node.relation for node in self.nodes]
-        pos = [node.pos for node in self.nodes]
 
         def dfs(node):
             for left in node.lefts:
@@ -183,7 +181,7 @@ class UDTree:
                 yield Transition(Actions.ARC_RIGHT, right.relation)
 
 
-        return chars, (list(dfs(self.root)), relations, pos)
+        return chars, list(dfs(self.root))
 
     def get_words(self):
         return [''.join(node.chars) for node in self.nodes]
@@ -246,7 +244,7 @@ class UDTree:
         def validate(tree):
             gold = tree.to_line()
 
-            chars, (trans, _, _) = tree.linearize()
+            chars, trans = tree.linearize()
             new_tree = UDTree.create(chars, trans)
             new_line = new_tree.to_line()
 
@@ -289,7 +287,7 @@ class TransitionClassifier(nn.Module):
         transitions = bundle([t[-1] for t in transition_hiddens])[0]
         features = torch.cat([buffers, stacks1, stacks2, transitions], 1)
 
-        return F.log_softmax(self.ffn(features) * mask, 1)
+        return F.log_softmax(self.ffn(features).masked_fill(mask, -1e-10), 1)
 
 
 class State:
@@ -460,6 +458,7 @@ class ArcStandard(nn.Module):
 
         # update composition node
         if len(need_comp_states) > 0:
+
             relation_emb = self.relation_emb(Variable(torch.LongTensor(self.relation_dict.convert(need_comp_relations)), requires_grad=False))
             new_heads = self.dependency_compsition(need_comp_heads, need_comp_modifiers, relation_emb)
             for state, new in zip(need_comp_states, new_heads):
@@ -482,13 +481,12 @@ class ArcStandard(nn.Module):
 
         return state_t
 
-    def loss(self, sentences, gold):
+    def loss(self, sentences, gold_transitions):
         '''
         :param sentences: [length, batch, dim]
         :param gold_transitions: [transition] * batch_size
         :return:
         '''
-        gold_transitions, gold_relations, gold_pos = gold
 
         #sentences, _ = self.encoder(sentences)
 
@@ -501,12 +499,15 @@ class ArcStandard(nn.Module):
         states = [State([], buffer, buffer_hidden,
                         [], [self.stack_lstm.begin(), self.stack_lstm.begin()],
                         [], [self.transition_lstm.begin()])
-                  for buffer, buffer_hidden, stack, pos in zip(buffers, buffer_hiddens, stacks, gold_pos)]
+                  for buffer, buffer_hidden, stack in zip(buffers, buffer_hiddens, stacks)]
 
-        max_transition_length = gold_transitions.size(0)
+        if gold_transitions is None:
+            max_transition_length = lengths[0] * 2 - 1
+        else:
+            max_transition_length = gold_transitions.size(0)
 
 
-        transition_losses = []
+        transition_loss = Variable(torch.FloatTensor([0]))
         transition_correct = 0
         transition_count = 1e-5
 
@@ -520,14 +521,26 @@ class ArcStandard(nn.Module):
 
         for t in range(max_transition_length):
             state_t, transition_id_t, mask_t = [], [], []
-            for state, transition_id in zip(states, gold_transitions[t].data):
-                if transition_id >= 0:
-                    state_t.append(state)
-                    transition_id_t.append(transition_id)
-                    transition = self.transition_dict.get_word(transition_id)
-                    #assert self.check(state.buffer, state.stack, state.transitions, transition)
-                    mask_t.append(self.mask(len(state.buffer), len(state.stack), state.transitions[-1] if len(state.transitions) > 0 else None))
-            if len(transition_id_t) == 0:
+            if gold_transitions is None:
+                for state in states:
+                    if len(state.buffer) > 1 or len(state.stack) > 1:
+                        state_t.append(state)
+                        mask_t.append(self.mask(len(state.buffer), len(state.stack),
+                                                state.transitions[-1] if len(state.transitions) > 0 else None))
+
+            else:
+
+                for state, transition_id in zip(states, gold_transitions[t].data):
+                    if transition_id >= 0:
+                        state_t.append(state)
+                        transition_id_t.append(transition_id)
+                        transition = self.transition_dict.get_word(transition_id)
+                        #assert self.check(state.buffer, state.stack, state.transitions, transition)
+                        mask_t.append(self.mask(len(state.buffer), len(state.stack),
+                                                state.transitions[-1] if len(state.transitions) > 0 else None))
+                transition_id_t = Variable(torch.LongTensor(transition_id_t), requires_grad=False)
+
+            if len(state_t) == 0:
                 break
 
             transition_mask = torch.cat(mask_t, 0)
@@ -537,20 +550,25 @@ class ArcStandard(nn.Module):
                                                          transition_mask)
 
             # caculate loss
-            transition_id_t = Variable(torch.LongTensor(transition_id_t), requires_grad=False)
-
-            transition_losses.append(F.nll_loss(transition_log_prob,
-                                            transition_id_t,
-                                            size_average=False))
-
             transition_log_max, transition_argmax = transition_log_prob.max(1)
-            transition_correct += (transition_argmax.data == transition_id_t.data).sum()
-            transition_count += transition_id_t.nelement()
+            if gold_transitions is None:
+                transition_loss += F.nll_loss(transition_log_prob,
+                                              transition_argmax,
+                                              size_average=False)
+                transition_id_t = transition_argmax
+            else:
+                transition_loss += F.nll_loss(transition_log_prob,
+                                                   transition_id_t,
+                                                   size_average=False)
+
+
+                transition_correct += (transition_argmax.data == transition_id_t.data).sum()
+
+            transition_count += transition_id_t.data.nelement()
 
             scores = torch.FloatTensor([state.score for state in state_t]) + transition_log_max.data
             self._update_state(state_t, transition_id_t, scores)
-
-        return (F.reduce(lambda x, y: x + y, transition_losses), transition_correct, transition_count), (sum(pos_loss)/pos_count, pos_correct, pos_count)
+        return (transition_loss, transition_correct, transition_count), (sum(pos_loss)/pos_count, pos_correct, pos_count)
 
     def mask(self, buffer_len, stack_len, last_transition):
         action_blacklist = set()
@@ -584,10 +602,10 @@ class ArcStandard(nn.Module):
 
         def to_mask(t):
             if t.action in action_blacklist:
-                return 0
-            return 1
+                return 1
+            return 0
 
-        masked = Variable(torch.FloatTensor([[to_mask(t) for t in self.transition_dict.words]]), requires_grad=False)
+        masked = Variable(torch.ByteTensor([[to_mask(t) for t in self.transition_dict.words]]), requires_grad=False)
         return masked
 
     @staticmethod
@@ -752,11 +770,11 @@ class ParserTask(Task):
 
     def _to_cuda(self, batch_data):
 
-        (sentences, gazes), (transitions, relations, pos) = batch_data
+        (sentences, gazes), transitions = batch_data
 
         return ((PackedSequence(sentences.data.cuda(), sentences.batch_sizes),
                  PackedSequence(gazes.data.cuda(), gazes.batch_sizes)),
-                (transitions.cuda(), relations.cuda(), pos.cuda())
+                transitions.cuda() if transitions else None
                 )
 
     def loss(self, batch_data, use_cuda=False):
@@ -781,21 +799,27 @@ class ParserTask(Task):
         if use_cuda:
             batch_data = self._to_cuda(batch_data)
 
-        sentences, (gold_trans, _, _) = batch_data
+        sentences, gold_trans = batch_data
         pred_transitions_and_score = self.parse(sentences, 5)
 
         sentences, lengths = pad_packed_sequence(sentences[0], batch_first=True, padding_value=-1)
         sentences = [self.vocab.get_word(sentence[0, :length].data.numpy())
                      for sentence, length in zip(sentences.split(1, 0), lengths)]
 
-        gold_trans = [gold_trans[:, sen_id] for sen_id in range(len(sentences))]
-        gold_trans = [t.masked_select(t >= 0) for t in gold_trans]
+        if gold_trans is None:
+            return ['score=%f\t%s\n' % (score, UDTree.create(sentence, pred).to_line())
+                    for sentence, (pred, score) in zip(sentences, pred_transitions_and_score)]
+        else:
+            gold_trans = [gold_trans[:, sen_id] for sen_id in range(len(sentences))]
+            gold_trans = [t.masked_select(t >= 0) for t in gold_trans]
 
-        samples = [(score, UDTree.create(sentence, self.transition_dict.get_word(gold.data)).to_line(),
-                    UDTree.create(sentence, pred).to_line())
-                   for sentence, gold, (pred, score) in zip(sentences, gold_trans, pred_transitions_and_score)]
+            samples = [(score, UDTree.create(sentence, self.transition_dict.get_word(gold.data)).to_line(),
+                        UDTree.create(sentence, pred).to_line())
+                       for sentence, gold, (pred, score) in zip(sentences, gold_trans, pred_transitions_and_score)]
 
-        return ['score=%f\nref:  %s\npred: %s\n' % (score, gold, pred) for score, gold, pred in samples if gold != pred]
+            return ['score=%f\nref:  %s\npred: %s\n' % (score, gold, pred) for score, gold, pred in samples if gold != pred]
+
+
 
 
     def evaluation(self, data, use_cuda=False):
@@ -817,7 +841,7 @@ class ParserTask(Task):
             if use_cuda:
                 batch = self._to_cuda(batch)
 
-            sentences, (transitions, _, _) = batch
+            sentences, transitions = batch
             pred_trans = self.parse(sentences)
 
             sentences, lengths = pad_packed_sequence(sentences[0], batch_first=True, padding_value=-1)
@@ -910,23 +934,39 @@ class CTBParseData(Loader):
         self.pos_counts = defaultdict(int)
         self.transition_counts = defaultdict(int)
         self.relation_counts = defaultdict(int)
-        for chars, (transitions, relations, pos) in self.train_data:
+        for chars, transitions in self.train_data:
             for t in transitions:
                 self.transition_counts[t] += 1
-                self.relation_counts[t.label] += 1
-            for p in pos:
-                self.pos_counts[p] += 1
+
+                if t.action == Actions.SHIFT:
+                    self.pos_counts[t.label] += 1
+                elif t.action in [Actions.ARC_LEFT, Actions.ARC_RIGHT]:
+                    self.relation_counts[t.label] += 1
 
             for char in chars:
                 self.word_counts[char] += 1
+
         self.test_data = self.load(test_paths)
 
         self.train_data = sorted(self.train_data, key=lambda item: len(item[0]), reverse=True)
         self.test_data = sorted(self.test_data, key=lambda item: len(item[0]), reverse=True)
 
         self.min_count = 5
-        transitions = [k if k.label is None or self.relation_counts[k.label] > self.min_count else Transition(k.action, 'UNK_RELATION')
-                                      for k, v in self.transition_counts.items()]
+        transitions = set()
+        for k, v in self.transition_counts.items():
+            if k.action == Actions.SHIFT:
+                if self.pos_counts[k.label] > self.min_count:
+                    transitions.add(k)
+                else:
+                    transitions.add(Transition(k.action, 'UNK_POS'))
+            elif k.action in [Actions.ARC_LEFT, Actions.ARC_RIGHT]:
+                if self.relation_counts[k.label] > self.min_count:
+                    transitions.add(k)
+                else:
+                    transitions.add(Transition(k.action, 'UNK_RELATION'))
+            else:
+                transitions.add(k)
+
 
         self.transition_dict = Vocab(transitions, unk=None)
         self.pos_dict = Vocab([k for k, v in self.pos_counts.items() if v > self.min_count], unk='UNK_POS')
@@ -968,27 +1008,133 @@ class CTBParseData(Loader):
             batch = sorted(batch, key=lambda item: len(item[0]), reverse=True)
             sen_lens = [len(s) for s, _ in batch]
             max_sen_len = max(sen_lens)
-            max_tran_len = max([len(trans) for _, (trans, _, _) in batch])
-            max_pos_len = max([len(pos) for _, (_, _, pos) in batch])
+            max_tran_len = max([len(trans) for _, trans in batch])
             sentences = torch.LongTensor(max_sen_len, len(batch)).fill_(0)
             gazes = torch.FloatTensor(max_sen_len, len(batch), gazetteers_dim).fill_(0)
             transitions = torch.LongTensor(max_tran_len, len(batch)).fill_(-1)
-            relations = torch.LongTensor(max_pos_len, len(batch)).fill_(-1)
-            pos = torch.LongTensor(max_pos_len, len(batch)).fill_(-1)
-            for id, (words, (trans, rel, str_pos)) in enumerate(batch):
+
+            for id, (words, trans) in enumerate(batch):
                 sen_len = len(words)
                 sentences[:sen_len, id] = torch.LongTensor(vocab.convert(words))
                 gazes[0:sen_len, id] = torch.cat([torch.FloatTensor(gazetteer.convert(words)) for gazetteer in gazetteers], -1)
                 tran_len = len(trans)
                 transitions[:tran_len, id] = torch.LongTensor(self.transition_dict.convert(trans))
-                relations[:len(rel), id] = torch.LongTensor(self.relation_dict.convert(rel))
-                pos[:len(str_pos), id] = torch.LongTensor(self.pos_dict.convert(str_pos))
+
             yield ((pack_padded_sequence(Variable(sentences), sen_lens),
                     pack_padded_sequence(Variable(gazes), sen_lens)),
-                   (Variable(transitions), Variable(relations), Variable(pos)))
+                   Variable(transitions))
 
     def batch_train(self, vocab, gazetteers, batch_size):
         return self._batch(self.train_data, vocab, gazetteers, batch_size)
 
     def batch_test(self, vocab, gazetteers, batch_size):
         return self._batch(self.test_data, vocab, gazetteers, batch_size)
+
+
+class RawData(Loader):
+    def __init__(self, train_paths, test_paths):
+        self.train_data = self.load(train_paths)
+
+        self.word_counts = defaultdict(int)
+        for chars in self.train_data:
+            for char in chars:
+                self.word_counts[char] += 1
+
+        self.test_data = self.load(test_paths)
+
+        self.train_data = sorted(self.train_data, key=lambda item: len(item), reverse=True)
+        self.test_data = sorted(self.test_data, key=lambda item: len(item), reverse=True)
+
+        self.num_pos = 10
+        pos_list = ['pos-%d' % p for p in range(self.num_pos)]
+
+        self.num_relation = 10
+        relation_list = ['rel-%d' % r for r in range(self.num_relation)]
+        transitions = list(itertools.chain.from_iterable([
+            [Transition(Actions.SHIFT, p) for p in pos_list],
+            [Transition(Actions.APPEND, None)],
+            [Transition(Actions.ARC_LEFT, r) for r in relation_list],
+            [Transition(Actions.ARC_RIGHT, r) for r in relation_list]
+        ]))
+
+        self.transition_dict = Vocab(transitions, unk=None)
+
+        self.pos_dict = Vocab(pos_list, unk=None)
+
+        self.relation_dict = Vocab(relation_list, unk=None)
+
+    def load(self, paths):
+        data = []
+        bad_data_count = 0
+        for path in paths:
+            with open(path) as file:
+                # uniq operation
+                #sentences = set(sentences)
+                for line in file:
+                    words = line.strip().split('\n')
+                    chars = [char if type == '@zh_char@' else type
+                             for word in words for type, char in replace_entity(word)]
+                    if len(chars) > 0:
+                        data.append(chars)
+        return data
+
+    def _batch(self, data, vocab, gazetteers, batch_size):
+
+        gazetteers_dim = sum([c.length() for c in gazetteers])
+
+        for begin in range(0, len(data), batch_size):
+            batch = data[begin:begin+batch_size]
+
+            batch = sorted(batch, key=lambda item: len(item), reverse=True)
+            sen_lens = [len(s) for s in batch]
+            max_sen_len = max(sen_lens)
+            sentences = torch.LongTensor(max_sen_len, len(batch)).fill_(0)
+            gazes = torch.FloatTensor(max_sen_len, len(batch), gazetteers_dim).fill_(0)
+
+            for id, words in enumerate(batch):
+                sen_len = len(words)
+                sentences[:sen_len, id] = torch.LongTensor(vocab.convert(words))
+                gazes[0:sen_len, id] = torch.cat([torch.FloatTensor(gazetteer.convert(words)) for gazetteer in gazetteers], -1)
+
+            yield ((pack_padded_sequence(Variable(sentences), sen_lens),
+                    pack_padded_sequence(Variable(gazes), sen_lens)),
+                   None)
+
+    def batch_train(self, vocab, gazetteers, batch_size):
+        return self._batch(self.train_data, vocab, gazetteers, batch_size)
+
+    def batch_test(self, vocab, gazetteers, batch_size):
+        return self._batch(self.test_data, vocab, gazetteers, batch_size)
+
+
+class SelfParserConfig(TaskConfig):
+
+    def __init__(self, name, train_paths, test_paths):
+        self.name = name
+        self.train_paths = train_paths
+        self.test_paths = test_paths
+
+        self.hidden_dim = 128
+        self.dropout = 0.2
+        self.shared_weight_decay = 1e-6
+        self.task_weight_decay = 1e-6
+
+        self._loader = None
+
+    def loader(self):
+        if self._loader is None:
+            self._loader = RawData(self.train_paths, self.test_paths)
+
+        return self._loader
+
+    def create_task(self, shared_vocab, shared_encoder):
+
+        loader = self.loader()
+
+        return ParserTask(self.name,
+                          shared_encoder, shared_vocab,
+                          loader.transition_dict, loader.relation_dict, loader.pos_dict,
+                          self.hidden_dim,
+                          self.dropout,
+                          self.shared_weight_decay,
+                          self.task_weight_decay)
