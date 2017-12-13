@@ -1,23 +1,34 @@
 
-
-from ..layer.crf import CRFLayer
-
 import torch.nn as nn
-from ..layer.qrnn import QRNN
-from torch.nn.utils.rnn import pad_packed_sequence, PackedSequence
 
 
-class Task(nn.Module):
+class Module(nn.Module):
+    def __init__(self):
+        super(Module, self).__init__()
+
+        self.use_cuda = False
+
+    def cuda(self, device):
+        super(Task, self).cuda(device)
+        self.use_cuda = True
+
+    def cpu(self):
+        super(Task, self).cpu()
+        self.use_cuda = False
+
+
+class Task(Module):
+
     def __init__(self):
         super(Task, self).__init__()
 
-    def loss(self, batch_data, use_cuda=False):
+    def loss(self, batch_data):
         pass
 
-    def evaluation(self, data, use_cuda=False):
+    def evaluation(self, data):
         pass
 
-    def sample(self, batch_data, use_cuda=False):
+    def sample(self, batch_data):
         pass
 
 

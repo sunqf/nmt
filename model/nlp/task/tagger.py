@@ -32,7 +32,7 @@ class TaggerTask(Task):
                        {'params': self.crf.parameters(), 'weight_decay': task_weight_decay}]
 
 
-    def loss(self, data, use_cuda=False):
+    def loss(self, data):
         (sentences, gazetteers), gold_tags = data
         crf_feature, _ = self.task_encoder(self.general_encoder(sentences, gazetteers))
         return self.crf.neg_log_likelihood(crf_feature, gold_tags)
@@ -71,7 +71,7 @@ class TaggerTask(Task):
         return count, true, pos
 
 
-    def evaluation(self, data, use_cuda=False):
+    def evaluation(self, data):
 
         self.eval()
         correct = 0
@@ -94,7 +94,7 @@ class TaggerTask(Task):
         return {'prec':prec, 'recall':recall, 'f-score':2*prec*recall/(prec+recall+1e-5)}
 
 
-    def sample(self, data, use_cuda=False):
+    def sample(self, data):
 
         self.eval()
         (sentences, gazetteers), gold_tags = data

@@ -112,7 +112,7 @@ class EncoderConfig:
 class MultiTaskConfig:
     def __init__(self):
         self.encoder_config = EncoderConfig()
-        self.batch_size = 2
+        self.batch_size = 32
         self.data_root = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/'
         # self.data_root = '/home/sunqf/Work/chinese_segment/data'
 
@@ -156,8 +156,8 @@ class MultiTaskConfig:
                                               ['/Users/sunqf/startup/corpus/wiki_zh_ja/dev.zh'])
         self.task_configs = [# people2014,
                              #ctb, msr, pku, nlpcc, ctb_pos,
-                             #ctb_parser_config,
-                             self_parser_config
+                             ctb_parser_config,
+                             #self_parser_config
         ]
 
         self.valid_size = 1000 // self.batch_size
@@ -170,7 +170,7 @@ class MultiTaskConfig:
 
         self.eval_step = 500
 
-        self.epoches = 10
+        self.epoches = 20
 
 def build(multi_config):
 

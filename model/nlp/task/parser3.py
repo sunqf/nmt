@@ -6,7 +6,7 @@ from torch.nn import functional as F
 from torch.autograd import Variable
 from collections import defaultdict, namedtuple
 import itertools
-from .task import Task, Loader, TaskConfig
+from .task import Module, Task, Loader, TaskConfig
 from torch.nn.utils.rnn import pad_packed_sequence, PackedSequence, pack_padded_sequence
 from ..util.vocab import Vocab
 from ..util.utils import replace_entity
@@ -30,7 +30,7 @@ def unbundle(state):
         return itertools.repeat(None)
     return torch.split(torch.cat(state, 1), 1, 0)
 
-class BoundaryLSTM(nn.Module):
+class BoundaryLSTM(Module):
     def __init__(self, input_dim, hidden_dim, num_layers, dropout=0.2):
         super(BoundaryLSTM, self).__init__()
 
@@ -42,9 +42,11 @@ class BoundaryLSTM(nn.Module):
         self.dropout_layer = nn.Dropout(self.dropout)
         self.lstm_cell = nn.LSTMCell(input_dim, hidden_dim, num_layers)
 
-        self._begin = nn.Parameter(torch.FloatTensor(1, hidden_dim*2))
+        self._begin = torch.nn.init.uniform(nn.Parameter(torch.FloatTensor(1, hidden_dim*2)),
+                                           -1, 1)
 
-        self._end = nn.Parameter(torch.FloatTensor(1, hidden_dim*2))
+        self._end = torch.nn.init.uniform(nn.Parameter(torch.FloatTensor(1, hidden_dim*2)),
+                                         -1, 1)
 
     def begin(self):
         return self._begin
@@ -75,7 +77,7 @@ class BoundaryLSTM(nn.Module):
 
 
 # 依存树的组合函数
-class Composition(nn.Module):
+class Composition(Module):
     def __init__(self, node_dim, relation_dim, dropout=0.2):
         super(Composition, self).__init__()
 
@@ -260,7 +262,7 @@ class UDTree:
         return UDTree(nodes, nodes[root_id])
 
 
-class TransitionClassifier(nn.Module):
+class TransitionClassifier(Module):
 
     def __init__(self, input_dim, num_transition, dropout=0.2):
         super(TransitionClassifier, self).__init__()
@@ -291,7 +293,11 @@ class TransitionClassifier(nn.Module):
 
 
 class State:
-    def __init__(self, nodes, buffer, buffer_hidden, stack, stack_hidden, transitions, transition_hidden, score=0.0):
+    def __init__(self, nodes,
+                 buffer, buffer_hidden,
+                 stack, stack_hidden,
+                 transitions, transition_hidden,
+                 score=0.0):
         self.nodes = nodes
         self.buffer = buffer
         self.buffer_hidden = buffer_hidden
@@ -311,13 +317,17 @@ class State:
         transitions_hidden = copy.copy(self.transitions_hidden)
         score = copy.copy(self.score)
 
-        new_state = State(nodes, buffer, buffer_hidden, stack, stack_hidden, transitions, transitions_hidden, score)
+        new_state = State(nodes,
+                          buffer, buffer_hidden,
+                          stack, stack_hidden,
+                          transitions, transitions_hidden,
+                          score)
         memodict[id(self)] = new_state
         return new_state
 
 
 # reference https://www.researchgate.net/profile/Yue_Zhang4/publication/266376262_Character-Level_Chinese_Dependency_Parsing/links/542e18030cf277d58e8e9908/Character-Level-Chinese-Dependency-Parsing.pdf
-class ArcStandard(nn.Module):
+class ArcStandard(Module):
     def __init__(self, input_dim, hidden_dim, transition_dict, relation_dict, pos_dict, dropout=0.2):
         super(ArcStandard, self).__init__()
 
@@ -328,6 +338,8 @@ class ArcStandard(nn.Module):
         self.pos_dict = pos_dict
         self.dropout = dropout
 
+        self.topk = 3
+
         # buffer hidden
         self.buffer_dim = self.hidden_dim
         self.buffer_lstm = BoundaryLSTM(input_dim, self.buffer_dim, 1, self.dropout)
@@ -336,29 +348,32 @@ class ArcStandard(nn.Module):
 
         # word embedding from char rnn
         self.word_dim = self.hidden_dim
-        self.pos_dim = self.hidden_dim // 2
-        self.pos_emb = nn.Embedding(len(self.pos_dict), self.pos_dim)
-        self.word_lstm = BoundaryLSTM(input_dim+self.pos_dim, self.word_dim, 1, self.dropout)
+        self.pos_emb_dim = self.word_dim * 2
+        self.pos_emb = nn.Embedding(len(self.pos_dict), self.pos_emb_dim)
+        self.word_lstm = BoundaryLSTM(input_dim, self.word_dim, 1, self.dropout)
+
 
         # stack hidden
         self.stack_dim = self.hidden_dim
         self.stack_lstm = BoundaryLSTM(self.word_dim, self.stack_dim, 1, self.dropout)
 
-        self.relation_dim = self.word_dim // 2
-        self.relation_emb = nn.Embedding(len(self.relation_dict), self.relation_dim)
+        self.relation_emb_dim = self.word_dim // 2
+        self.relation_emb = nn.Embedding(len(self.relation_dict), self.relation_emb_dim)
         # compose head and modifier
-        self.dependency_compsition = Composition(self.word_dim, self.relation_dim)
+
+        self.dependency_compsition = Composition(self.word_dim, self.relation_emb_dim)
 
         # transition id to embedding
-        self.transition_dim = self.hidden_dim // 4
-        self.transition_emb = nn.Embedding(len(self.transition_dict), self.transition_dim)
+        self.transition_emb_dim = self.hidden_dim // 4
+        self.transition_emb = nn.Embedding(len(self.transition_dict), self.transition_emb_dim)
         # transition hidden
-        self.transition_lstm = BoundaryLSTM(self.transition_dim, self.transition_dim, 1, self.dropout)
-
+        self.transition_lstm_dim = self.hidden_dim
+        self.transition_lstm = BoundaryLSTM(self.transition_emb_dim, self.transition_lstm_dim, 1, self.dropout)
+        #self.transition_lstm = BoundaryLSTM(len(self.transition_dict), self.transition_dim, self.dropout)
 
         #self.encoder = QRNN(input_dim, feature_dim, 1,
         #                    window_sizes=3, dropout=dropout)
-        self.transition_classifier = TransitionClassifier(self.buffer_dim + self.stack_dim * 2 + self.transition_dim,
+        self.transition_classifier = TransitionClassifier(self.buffer_dim + self.stack_dim * 2 + self.transition_lstm_dim,
                                                           len(self.transition_dict), self.dropout)
 
 
@@ -387,7 +402,7 @@ class ArcStandard(nn.Module):
         return buffers, buffer_hiddens, lengths
 
 
-    def _update_state(self, state_t, transition_id_t, scores):
+    def _update_state(self, state_t, transition_id_t, transition_log_probs):
         """
         :param state_t: [state] * batch_size
         :param transition_id_t: Variable(LongTensor(batch_size))
@@ -404,13 +419,17 @@ class ArcStandard(nn.Module):
             if t.action == Actions.SHIFT:
                 next_char = state.buffer.pop()
                 state.buffer_hidden.pop()
-                node = Node(len(state.nodes), [self.word_lstm.begin()], t.label)
+                pos_id = Variable(torch.LongTensor([self.pos_dict.convert(t.label)]))
+                if self.use_cuda:
+                    pos_id = pos_id.cuda()
+                pos_emb = self.pos_emb(pos_id)
+                node = Node(len(state.nodes), [pos_emb], t.label)
                 state.nodes.append(node)
 
                 update_nodes.append(node)
                 update_char_inputs.append(next_char)
-                update_pos.append(node.pos)
                 update_char_hiddens.append(node.chars[-1])
+
             elif t.action == Actions.APPEND:
                 next_char = state.buffer.pop()
                 state.buffer_hidden.pop()
@@ -418,19 +437,16 @@ class ArcStandard(nn.Module):
 
                 update_nodes.append(node)
                 update_char_inputs.append(next_char)
-                update_pos.append(node.pos)
                 update_char_hiddens.append(node.chars[-1])
 
         if len(update_nodes) > 0:
-            update_pos_embs = self.pos_emb(Variable(torch.LongTensor(self.pos_dict.convert(update_pos)), requires_grad=False))
-            update_char_inputs = torch.cat(update_char_inputs, 0)
-            new_char_hidden = self.word_lstm(torch.cat([update_char_inputs, update_pos_embs], 1), update_char_hiddens)
+            new_char_hidden = self.word_lstm(update_char_inputs, update_char_hiddens)
             for node, new in zip(update_nodes, new_char_hidden):
                 node.chars.append(new)
 
         need_comp_states, need_comp_heads, need_comp_modifiers, need_comp_relations = [], [], [], []
-        for state, t, score in zip(state_t, transition_t, scores):
-            state.score = score
+        for state, t, tid, log_prob in zip(state_t, transition_t, transition_id_t.data, transition_log_probs.data):
+            state.score += log_prob[tid]
             if t.action == Actions.SHIFT:
                 state.stack.append(word_emb(state.nodes[-1].chars))
             elif t.action == Actions.APPEND:
@@ -458,8 +474,11 @@ class ArcStandard(nn.Module):
 
         # update composition node
         if len(need_comp_states) > 0:
+            need_comp_relations = Variable(torch.LongTensor(self.relation_dict.convert(need_comp_relations)))
+            if self.use_cuda:
+                need_comp_relations = need_comp_relations.cuda()
 
-            relation_emb = self.relation_emb(Variable(torch.LongTensor(self.relation_dict.convert(need_comp_relations)), requires_grad=False))
+            relation_emb = self.relation_emb(need_comp_relations)
             new_heads = self.dependency_compsition(need_comp_heads, need_comp_modifiers, relation_emb)
             for state, new in zip(need_comp_states, new_heads):
                 state.stack.append(new)
@@ -472,9 +491,11 @@ class ArcStandard(nn.Module):
             state.stack_hidden.append(stack_hidden)
 
         # update transition hidden
+        #selected_probs = transition_log_probs.gather(1, transition_id_t.unsqueeze(1))
         transition_embs = self.transition_emb(transition_id_t)
         new_transition_hiddens = self.transition_lstm(transition_embs,
                                                       [state.transitions_hidden[-1] for state in state_t])
+
         for state, transition, transition_hidden in zip(state_t, transition_t, new_transition_hiddens):
             state.transitions.append(transition)
             state.transitions_hidden.append(transition_hidden)
@@ -508,6 +529,9 @@ class ArcStandard(nn.Module):
 
 
         transition_loss = Variable(torch.FloatTensor([0]))
+        if self.use_cuda:
+            transition_loss = transition_loss.cuda()
+
         transition_correct = 0
         transition_count = 1e-5
 
@@ -539,6 +563,8 @@ class ArcStandard(nn.Module):
                         mask_t.append(self.mask(len(state.buffer), len(state.stack),
                                                 state.transitions[-1] if len(state.transitions) > 0 else None))
                 transition_id_t = Variable(torch.LongTensor(transition_id_t), requires_grad=False)
+                if self.use_cuda:
+                    transition_id_t = transition_id_t.cuda()
 
             if len(state_t) == 0:
                 break
@@ -550,24 +576,19 @@ class ArcStandard(nn.Module):
                                                          transition_mask)
 
             # caculate loss
-            transition_log_max, transition_argmax = transition_log_prob.max(1)
             if gold_transitions is None:
+                _, transition_id_t = transition_log_prob.max(1)
                 transition_loss += F.nll_loss(transition_log_prob,
-                                              transition_argmax,
+                                              transition_id_t,
                                               size_average=False)
-                transition_id_t = transition_argmax
             else:
                 transition_loss += F.nll_loss(transition_log_prob,
                                                    transition_id_t,
                                                    size_average=False)
 
-
-                transition_correct += (transition_argmax.data == transition_id_t.data).sum()
-
             transition_count += transition_id_t.data.nelement()
 
-            scores = torch.FloatTensor([state.score for state in state_t]) + transition_log_max.data
-            self._update_state(state_t, transition_id_t, scores)
+            self._update_state(state_t, transition_id_t, transition_log_prob)
         return (transition_loss, transition_correct, transition_count), (sum(pos_loss)/pos_count, pos_correct, pos_count)
 
     def mask(self, buffer_len, stack_len, last_transition):
@@ -588,17 +609,6 @@ class ArcStandard(nn.Module):
         if stack_len < 2:
             action_blacklist.add(Actions.ARC_LEFT)
             action_blacklist.add(Actions.ARC_RIGHT)
-        '''
-        transition_whitelist = set()
-        if last_transition is not None and last_transition.action == Actions.SHIFT:
-            action_blacklist.add(Actions.APPEND)
-            transition_whitelist.add(Transition(Actions.APPEND, last_transition.label))
-
-        def to_mask(t):
-            if t.action in action_blacklist and t is not transition_whitelist:
-                return 0
-            return 1
-        '''
 
         def to_mask(t):
             if t.action in action_blacklist:
@@ -606,6 +616,8 @@ class ArcStandard(nn.Module):
             return 0
 
         masked = Variable(torch.ByteTensor([[to_mask(t) for t in self.transition_dict.words]]), requires_grad=False)
+        if self.use_cuda:
+            masked = masked.cuda()
         return masked
 
     @staticmethod
@@ -668,29 +680,34 @@ class ArcStandard(nn.Module):
                                                          [state.stack_hidden for state in topK],
                                                          [state.transitions_hidden for state in topK],
                                                          transition_mask)
-
-            transition_log_prob = transition_log_prob.split(1, 0)
-
-
+            _, transition_topk = transition_log_prob.topk(self.topk, 1)
 
             step1, step2 = [], []
-            for state, log_probs in zip(topK, transition_log_prob):
-                for transition_id, log_prob in enumerate(log_probs.squeeze().data):
+            for state, log_probs in zip(topK, transition_log_prob.data):
+                for transition_id, log_prob in enumerate(log_probs):
                     transition = self.transition_dict.get_word(transition_id)
                     if self.check(state.buffer, state.stack, state.transitions, transition):
                         if transition.action in [Actions.SHIFT, Actions.ARC_LEFT, Actions.ARC_RIGHT]:
-                            step1.append((state, transition, state.score+log_prob))
+                            step1.append((state, transition, log_probs, state.score+log_prob))
                         else:
                             # append = shift + reduce
-                            step2.append((state, transition, state.score+log_prob))
+                            step2.append((state, transition, log_probs, state.score+log_prob))
 
-            sorted_cands = sorted(step1 + next1, key=lambda c: c[2], reverse=True)
+            sorted_cands = sorted(step1 + next1, key=lambda c: c[-1], reverse=True)
 
             topK = sorted_cands[0: beam_size]
 
-            topK = self._update_state([copy.deepcopy(state) for state, _, _ in topK],
-                                      Variable(torch.LongTensor(self.transition_dict.convert([transition for _, transition, _ in topK]))),
-                                      torch.FloatTensor([score for _, _, score in topK]))
+            transition_id_t = Variable(
+                torch.LongTensor(self.transition_dict.convert([transition for _, transition, _, _ in topK])))
+            if self.use_cuda:
+                transition_id_t = transition_id_t.cuda()
+
+            transition_log_prob = Variable(
+                torch.cat([log_prob.unsqueeze(0) for _, _, log_prob, _ in topK], 0))
+
+            topK = self._update_state([copy.deepcopy(state) for state, _, _, _ in topK],
+                                      transition_id_t,
+                                      transition_log_prob)
             next1 = step2
 
         return topK[0].transitions, topK[0].score
@@ -749,6 +766,8 @@ class ParserTask(Task):
         self.shared_weight_decay = shared_weight_decay
         self.task_weight_decay = task_weight_decay
 
+        self.use_cuda = False
+
         self.parser = ArcStandard(self.shared_encoder.output_dim(),
                                   self.hidden_dim,
                                   self.transition_dict,
@@ -760,7 +779,6 @@ class ParserTask(Task):
         self.params = [{'params': self.shared_encoder.parameters(), 'weight_decay': self.shared_weight_decay},
                        #{'params': self.task_encoder.parameters(), 'weight_decay': task_weight_decay},
                        {'params': self.parser.parameters(), 'weight_decay': self.task_weight_decay}]
-
 
     def forward(self, sentences, transitions):
         sentences, gazetteers = sentences
@@ -777,9 +795,9 @@ class ParserTask(Task):
                 transitions.cuda() if transitions else None
                 )
 
-    def loss(self, batch_data, use_cuda=False):
+    def loss(self, batch_data):
 
-        if use_cuda:
+        if self.use_cuda:
             batch_data = self._to_cuda(batch_data)
 
         sentences, reference = batch_data
@@ -794,9 +812,9 @@ class ParserTask(Task):
 
         return self.parser.parse(features, beam_size)
 
-    def sample(self, batch_data, use_cuda=False):
+    def sample(self, batch_data):
 
-        if use_cuda:
+        if self.use_cuda:
             batch_data = self._to_cuda(batch_data)
 
         sentences, gold_trans = batch_data
@@ -822,7 +840,7 @@ class ParserTask(Task):
 
 
 
-    def evaluation(self, data, use_cuda=False):
+    def evaluation(self, data):
 
         seg_correct = 0
         pos_correct = 0
@@ -838,7 +856,7 @@ class ParserTask(Task):
 
 
         for batch in data:
-            if use_cuda:
+            if self.use_cuda:
                 batch = self._to_cuda(batch)
 
             sentences, transitions = batch
@@ -953,20 +971,22 @@ class CTBParseData(Loader):
 
         self.min_count = 5
         transitions = set()
-        for k, v in self.transition_counts.items():
-            if k.action == Actions.SHIFT:
-                if self.pos_counts[k.label] > self.min_count:
-                    transitions.add(k)
-                else:
-                    transitions.add(Transition(k.action, 'UNK_POS'))
-            elif k.action in [Actions.ARC_LEFT, Actions.ARC_RIGHT]:
-                if self.relation_counts[k.label] > self.min_count:
-                    transitions.add(k)
-                else:
-                    transitions.add(Transition(k.action, 'UNK_RELATION'))
-            else:
-                transitions.add(k)
 
+        def convert(t, count):
+            if t.action == Actions.SHIFT:
+                if self.pos_counts[t.label] > self.min_count:
+                    return t
+                else:
+                    return Transition(t.action, 'UNK_POS')
+            elif t.action in [Actions.ARC_LEFT, Actions.ARC_RIGHT]:
+                if self.relation_counts[t.label] > self.min_count:
+                    return t
+                else:
+                    return Transition(t.action, 'UNK_RELATION')
+            else:
+                return t
+
+        transitions = set(convert(k, v) for k, v in self.transition_counts.items())
 
         self.transition_dict = Vocab(transitions, unk=None)
         self.pos_dict = Vocab([k for k, v in self.pos_counts.items() if v > self.min_count], unk='UNK_POS')
