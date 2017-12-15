@@ -1,108 +1,22 @@
+
+
 import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.autograd import Variable
 from collections import defaultdict, namedtuple
 import itertools
-from ..layer.encoder import Encoder
-from ..layer.qrnn import QRNN
-from ..layer.crf import CRFLayer
-from .task import Task, Loader
+from .task import Module, Task, Loader, TaskConfig
 from torch.nn.utils.rnn import pad_packed_sequence, PackedSequence, pack_padded_sequence
-from ..util.vocab import Vocab, CharacterAttribute, Gazetteer
-from sklearn.model_selection import train_test_split
+from ..util.vocab import Vocab
+from ..util.utils import replace_entity
+
+import copy
 
 import numpy as np
 
-def tree_lstm(c1, c2, lstm_in):
-    a, i, f1, f2, o = lstm_in.chunk(5, 1)
-    c = a.tanh() * i.sigmoid() + f1.sigmoid() * c1 + f2.sigmoid() * c2
-    h = o.sigmoid() * c.tanh()
-    return h, c
+import random
 
-class BinaryTreeLSTM(nn.Module):
-
-    def __init__(self, size, tracker_size):
-        super(BinaryTreeLSTM, self).__init__()
-
-        self.left = nn.Linear(size, 5 * size)
-        self.right = nn.Linear(size, 5 * size, bias=False)
-        if tracker_size is not None:
-            self.track = nn.Linear(tracker_size, 5 * size, bias=False)
-
-    def forward(self, left, right, tracking):
-        lstm_in = self.left(left[0])
-        lstm_in += self.right(right[0])
-        if hasattr(self, 'track'):
-            lstm_in += self.track(tracking[0])
-
-        return tree_lstm(left[1], right[1], lstm_in)
-
-class DependencyTreeLSTM(nn.Module):
-
-    def __init__(self, size, tracker_size):
-        super(DependencyTreeLSTM, self).__init__()
-
-        self.size = size
-        # input, output, update
-        self.iou = nn.Linear(size, 3 * size)
-
-        # forget
-        self.forget = nn.Linear(size, size)
-
-        self.tracker_size = tracker_size
-        if tracker_size is not None:
-            self.iou_track = nn.Linear(self.tracker_size, 3 * size, bias=False)
-            self.forget_track = nn.Linear(self.tracker_size, size, bias=False)
-
-    def forward(self, childrens, tracking):
-        '''
-        :param children: [batch * [num_child * Tensor(1, size)]
-        :param tracking: [batch * Tensor[1, size]]
-        :return: [batch * Tensor[1, size]]
-        '''
-        lens = [len(children) for children in childrens]
-
-        tracking_h, tracking_c = torch.cat(tracking, 0).chunk(2, 1)
-
-        childrens = [torch.cat(children, 0) for children in childrens]
-
-        mean_h, mean_c = torch.cat([children.mean(0) for children in childrens], 0).chunk(2, 1)
-        iou = self.iou(mean_h)
-        if self.tracker_size:
-            iou += self.iou_track(tracking_h)
-
-        i, o, u = iou.chunk(3, 1)
-
-        i = i.sigmoid()
-        o = o.sigmoid()
-        u = u.tanh()
-
-        children_h, children_c = torch.cat(childrens, 0).chunk(2, 1)
-        f = self.forget(children_h)
-        if self.tracker_size:
-            forget_track = self.forget_track(tracking_h)
-
-            forget_track = torch.cat([forget_track[b].expand(len, self.size)
-                                      for b, len in enumerate(lens)],
-                                     0)
-            f += forget_track
-
-
-        fc = f.sigmoid() * children_c
-
-        cumfc = []
-        start = 0
-        for len in lens:
-            cumfc.append(fc[0:len].sum(0).unsqueeze(0))
-            start += len
-
-        fc = torch.cat(cumfc, 0)
-
-        c = i * u + fc
-        h = o * c
-
-        return unbundle((h, c))
 
 def bundle(lstm_iter):
     if lstm_iter is None:
@@ -118,462 +32,997 @@ def unbundle(state):
         return itertools.repeat(None)
     return torch.split(torch.cat(state, 1), 1, 0)
 
+class BoundaryLSTM(Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, dropout=0.2):
+        super(BoundaryLSTM, self).__init__()
 
-class Reduce(nn.Module):
-    """TreeLSTM composition module for SPINN.
-    The TreeLSTM has two or three inputs: the first two are the left and right
-    children being composed; the third is the current state of the tracker
-    LSTM if one is present in the SPINN model.
-    Args:
-        size: The size of the model state.
-        tracker_size: The size of the tracker LSTM hidden state, or None if no
-            tracker is present.
-    """
-
-    def __init__(self, size, tracker_size=None):
-        super(Reduce, self).__init__()
-        self.tree_lstm = BinaryTreeLSTM(size, tracker_size)
-
-    def forward(self, left_in, right_in, tracking=None):
-        """Perform batched TreeLSTM composition.
-        This implements the REDUCE operation of a SPINN in parallel for a
-        batch of nodes. The batch size is flexible; only provide this function
-        the nodes that actually need to be REDUCEd.
-        The TreeLSTM has two or three inputs: the first two are the left and
-        right children being composed; the third is the current state of the
-        tracker LSTM if one is present in the SPINN model. All are provided as
-        iterables and batched internally into tensors.
-        Additionally augments each new node with pointers to its children.
-        Args:
-            left_in: Iterable of ``B`` ~autograd.Variable objects containing
-                ``c`` and ``h`` concatenated for the left child of each node
-                in the batch.
-            right_in: Iterable of ``B`` ~autograd.Variable objects containing
-                ``c`` and ``h`` concatenated for the right child of each node
-                in the batch.
-            tracking: Iterable of ``B`` ~autograd.Variable objects containing
-                ``c`` and ``h`` concatenated for the tracker LSTM state of
-                each node in the batch, or None.
-        Returns:
-            out: Tuple of ``B`` ~autograd.Variable objects containing ``c`` and
-                ``h`` concatenated for the LSTM state of each new node. These
-                objects are also augmented with ``left`` and ``right``
-                attributes.
-        """
-        left, right = bundle(left_in), bundle(right_in)
-        tracking = bundle(tracking)
-        out = unbundle(self.tree_lstm(left, right, tracking))
-        # for o, l, r in zip(out, left_in, right_in):
-        #     o.left, o.right = l, r
-        return out
-
-class Contexter(nn.Module):
-
-    def __init__(self, size, tracker_size, predict):
-        super(Contexter, self).__init__()
-        self.rnn = nn.LSTMCell(3 * size, tracker_size)
-        self.state_size = tracker_size
-        if predict:
-            self.transition = nn.Linear(tracker_size, 3)
-
-    def forward(self, bufs, stacks, prev_state):
-        '''
-
-        :param bufs: buffer list.
-        :param stacks: stack list.
-        :param prev:
-        :return:
-        '''
-        buf = bundle(buf[-1] for buf in bufs)[0]
-        stack1 = bundle(stack[-1] for stack in stacks)[0]
-        stack2 = bundle(stack[-2] for stack in stacks)[0]
-
-        x = torch.cat((buf, stack1, stack2), 1)
-
-        prev = bundle(s[-1] for s in prev_state)
-        prev = self.rnn(x, prev)
-        if hasattr(self, 'transition'):
-            return unbundle(prev), self.transition(prev[0])
-
-        return unbundle(prev)
-
-class Action:
-    NONE = 0
-    SHIFT = 1
-    REDUCE = 2
-
-    def convert(action):
-        if action == 'shift':
-            return Action.SHIFT
-        elif action == 'reduce':
-            return Action.REDUCE
-        else:
-            return Action.NONE
-
-class SPINN(nn.Module):
-
-    def __init__(self, input_dim, feature_dim, tracker_dim, predict):
-        super(SPINN, self).__init__()
         self.input_dim = input_dim
-        self.feature_dim = feature_dim
-        self.tracker_dim = tracker_dim
-        self.projection = nn.Linear(input_dim, feature_dim * 2)
-        self.reduce = Reduce(feature_dim, tracker_dim)
-        self.contexter = Contexter(feature_dim, tracker_dim,
-                                   predict=True)
+        self.feature_dim = hidden_dim
+        self.num_layers = num_layers
+        self.dropout = dropout
 
-        self.sentence_end = nn.Parameter(torch.FloatTensor(1, feature_dim * 2).zero_())
-        self.stack_base = nn.Parameter(torch.FloatTensor(1, feature_dim * 2).zero_())
-        self.context_begin = nn.Parameter(torch.FloatTensor(1, tracker_dim * 2).zero_())
+        self.dropout_layer = nn.Dropout(self.dropout)
+        self.lstm_cell = nn.LSTMCell(input_dim, hidden_dim, num_layers)
 
-        self.reset_parameters()
+        self._begin = torch.nn.init.uniform(nn.Parameter(torch.FloatTensor(1, hidden_dim*2)),
+                                           -1, 1)
 
-    def reset_parameters(self):
-        import math
-        torch.nn.init.xavier_uniform(self.sentence_end)
-        torch.nn.init.xavier_uniform(self.stack_base)
-        torch.nn.init.xavier_uniform(self.context_begin)
+        self._end = torch.nn.init.uniform(nn.Parameter(torch.FloatTensor(1, hidden_dim*2)),
+                                         -1, 1)
+
+    def begin(self):
+        return self._begin
+
+    def end(self):
+        return self._end
+
+    def forward_end(self, hidden):
+        return self.forward([self._end]*len(hidden), hidden)
+
+    def forward(self, input, hidden=None):
+        """
+        :param input: [tensor(1, input_dim)] * batch_size or list
+        :param hidden: [tensor(1, hidden_dim*2)] * batch_size or None
+        :return: [tensor(1, hidden_dim*2)] * batch_size,
+        """
+        if isinstance(input, list):
+            input = torch.cat(input, 0)
+
+        if hidden is None:
+            hidden = [self._begin] * input.size(0)
+        if isinstance(hidden, list):
+            hidden = bundle(hidden)
+
+        new_hx, new_cx = self.lstm_cell(self.dropout_layer(input), hidden)
+
+        return unbundle([new_hx, new_cx])
+
+
+# 依存树的组合函数
+class Composition(Module):
+    def __init__(self, node_dim, relation_dim, dropout=0.2):
+        super(Composition, self).__init__()
+
+        self.node_dim = node_dim
+        self.relation_dim = relation_dim
+        self.dropout = dropout
+        self.model = nn.Sequential(nn.Dropout(self.dropout),
+                                   nn.Linear(node_dim * 2 + relation_dim, node_dim),
+                                   nn.Tanh())
+
+    def forward(self, heads, modifiers, relations):
+        '''
+        :param heads: [tensor(1, self.node_dim)] * batch_size  or  tensor(batch_size, self.node_dim)
+        :param modifiers:  [tensor(1, self.node_dim)] * batch_size   or  tensor(batch_size, self.node_dim)
+        :param relations: [tensor(1, self.relation_dim)] * batch_size   or  tensor(batch_size, self.relation_dim)
+        :return: [tensor(1, self.node_dim)] * batch_size
+        '''
+        if isinstance(heads, list):
+            heads = torch.cat(heads, 0)
+        if isinstance(modifiers, list):
+            modifiers = torch.cat(modifiers, 0)
+        if isinstance(relations, list):
+            relations = torch.cat(relations, 0)
+
+        comp = self.model(torch.cat([heads, modifiers, relations], 1))
+
+        return comp.split(1, 0)
+
+class Node:
+    def __init__(self, index, chars, pos=None, head_index=-1, relation=None, lefts=None, rights=None):
+        self.index = index
+        self.chars = chars if chars else []
+        self.pos = pos
+        self.head_index = head_index
+        self.relation = relation
+        self.lefts = lefts if lefts else []
+        self.rights = rights if rights else []
+
+    def __len__(self):
+        return len(self.chars)
+
+    def __str__(self):
+        return '(%s\t%s\t%s)' % ('\t'.join([str(left) for relation, left in self.lefts]),
+                                 ''.join(self.chars),
+                                 '\t'.join([str(right) for relation, right in self.rights]))
+
+    def __deepcopy__(self, memodict={}):
+
+        index = copy.copy(self.index)
+        chars = copy.copy(self.chars)
+        pos = copy.copy(self.pos)
+        head_index = copy.copy(self.head_index)
+        relation = copy.copy(self.relation)
+        lefts = copy.deepcopy(self.lefts, memodict)
+        rights = copy.deepcopy(self.rights, memodict)
+        new_node = Node(index, chars, pos, head_index, relation, lefts, rights)
+        memodict[id(self)] = new_node
+        return new_node
+
+class Actions:
+    SHIFT = 0
+    APPEND = 1
+    ARC_LEFT = 2
+    ARC_RIGHT = 3
+    #ROOT = 4
+    max_len = 4
+
+class Transition:
+    def __init__(self, action, label):
+        self.action = action
+        self.label = label
+
+    def __eq__(self, other):
+        return hash(self) == hash(other) and self.action == other.action and self.label == other.label
+
+    def __hash__(self):
+        return hash(self.action) + hash(self.label)
+
+    def __str__(self):
+        return '%d,%s' % (self.action, self.label)
+
+class UDTree:
+    def __init__(self, nodes, root):
+        self.nodes = nodes
+        self.root = root
+
+    def linearize(self):
+        chars = list(itertools.chain.from_iterable([node.chars for node in self.nodes]))
+
+        def dfs(node):
+            for left in node.lefts:
+                yield from dfs(left)
+
+            yield Transition(Actions.SHIFT, node.pos)
+            for c in node.chars[1:]:
+                yield Transition(Actions.APPEND, None)
+
+            for l in node.lefts[::-1]:
+                yield Transition(Actions.ARC_LEFT, l.relation)
+
+            for right in node.rights:
+                yield from dfs(right)
+                yield Transition(Actions.ARC_RIGHT, right.relation)
+
+
+        return chars, list(dfs(self.root))
+
+    def get_words(self):
+        return [''.join(node.chars) for node in self.nodes]
+
+    def to_line(self):
+        return '\t'.join(['%s#%s#%d#%s' % (''.join(node.chars), node.pos, node.head_index, node.relation) for node in self.nodes])
+
+    @staticmethod
+    def create(chars, transitons):
+        nodes = []
+        stack = []
+        char_index = 0
+        word_index = 0
+        for tran in transitons:
+            if tran.action == Actions.SHIFT:
+                new_node = Node(word_index, [chars[char_index]], tran.label)
+                stack.append(new_node)
+                nodes.append(new_node)
+                char_index += 1
+                word_index += 1
+            elif tran.action == Actions.APPEND:
+                stack[-1].chars.append(chars[char_index])
+                char_index += 1
+            elif tran.action == Actions.ARC_LEFT:
+                head = stack.pop()
+                modifier = stack.pop()
+                modifier.head_index = head.index
+                modifier.relation = tran.label
+                head.lefts.append(modifier)
+                stack.append(head)
+            elif tran.action == Actions.ARC_RIGHT:
+                modifier = stack.pop()
+                head = stack[-1]
+                head.rights.append(modifier)
+                modifier.head_index = head.index
+                modifier.relation = tran.label
+
+        for node in nodes:
+            node.lefts = list(reversed(node.lefts))
+
+        stack[-1].relation = 'root'
+
+        return UDTree(nodes, stack[-1])
+
+    @staticmethod
+    def parse_stanford_format(tokens):
+        nodes = [Node(index, chars, pos, int(parent_id)-1, relation) for index, (chars, pos, parent_id, relation) in enumerate(tokens)]
+
+        root_id = 0
+        for id, (token, pos, parent_id, relation) in enumerate(tokens):
+            parent_id = int(parent_id) - 1
+
+            if parent_id == -1:
+                root_id = id
+            elif parent_id > id:
+                nodes[parent_id].lefts.append(nodes[id])
+            elif parent_id < id:
+                nodes[parent_id].rights.append(nodes[id])
+
+        def validate(tree):
+            gold = tree.to_line()
+
+            chars, trans = tree.linearize()
+            new_tree = UDTree.create(chars, trans)
+            new_line = new_tree.to_line()
+
+            return gold == new_line
+
+        tree = UDTree(nodes, nodes[root_id])
+
+        if validate(tree) is False:
+            print('invalid tree:')
+            print(tree.to_line())
+            return None
+
+        return UDTree(nodes, nodes[root_id])
+
+
+class TransitionClassifier(Module):
+
+    def __init__(self, input_dim, num_transition, dropout=0.2):
+        super(TransitionClassifier, self).__init__()
+
+        self.num_transition = num_transition
+        self.input_dim = input_dim
+
+        self.dropout = dropout
+
+        self.ffn = nn.Sequential(nn.Dropout(dropout),
+                                 nn.Linear(self.input_dim, self.input_dim//2),
+                                 nn.Sigmoid(),
+                                 nn.Dropout(dropout),
+                                 nn.Linear(self.input_dim//2, self.input_dim//2),
+                                 nn.Sigmoid(),
+                                 nn.Linear(self.input_dim//2, num_transition)
+                                 )
+
+    def forward(self, buffer_hiddens, stack_hiddens, transition_hiddens, mask):
+
+        buffers = bundle([b[-1] for b in buffer_hiddens])[0]
+        stacks1 = bundle([s[-1] for s in stack_hiddens])[0]
+        stacks2 = bundle([s[-2] for s in stack_hiddens])[0]
+        transitions = bundle([t[-1] for t in transition_hiddens])[0]
+        features = torch.cat([buffers, stacks1, stacks2, transitions], 1)
+
+        return F.log_softmax(self.ffn(features).masked_fill(mask == 0, -1e15), 1)
+
+
+class State:
+    def __init__(self, nodes,
+                 buffer, buffer_hidden,
+                 stack, stack_hidden,
+                 transitions, transition_hidden,
+                 score=0.0):
+        self.nodes = nodes
+        self.buffer = buffer
+        self.buffer_hidden = buffer_hidden
+        self.stack = stack
+        self.stack_hidden = stack_hidden
+        self.transitions = transitions
+        self.transitions_hidden = transition_hidden
+        self.score = score
+
+    def __deepcopy__(self, memodict={}):
+        nodes = copy.deepcopy(self.nodes, memodict)
+        buffer = copy.copy(self.buffer)
+        buffer_hidden = copy.copy(self.buffer_hidden)
+        stack = copy.copy(self.stack)
+        stack_hidden = copy.copy(self.stack_hidden)
+        transitions = copy.copy(self.transitions)
+        transitions_hidden = copy.copy(self.transitions_hidden)
+        score = copy.copy(self.score)
+
+        new_state = State(nodes,
+                          buffer, buffer_hidden,
+                          stack, stack_hidden,
+                          transitions, transitions_hidden,
+                          score)
+        memodict[id(self)] = new_state
+        return new_state
+
+
+# reference https://www.researchgate.net/profile/Yue_Zhang4/publication/266376262_Character-Level_Chinese_Dependency_Parsing/links/542e18030cf277d58e8e9908/Character-Level-Chinese-Dependency-Parsing.pdf
+class ArcStandard(Module):
+    def __init__(self, input_dim, hidden_dim, transition_dict, relation_dict, pos_dict, dropout=0.2, teacher_forcing_ratio=0.5):
+        super(ArcStandard, self).__init__()
+
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.transition_dict = transition_dict
+        self.relation_dict = relation_dict
+        self.pos_dict = pos_dict
+        self.dropout = dropout
+
+        self.teacher_forcing_ratio = teacher_forcing_ratio
+
+        self.topk = 3
+
+        # buffer hidden
+        self.buffer_dim = self.hidden_dim
+        self.buffer_lstm = BoundaryLSTM(input_dim, self.buffer_dim, 1, self.dropout)
+
+        #self.buffer_lstm = nn.LSTM(input_dim, self.buffer_dim, 1, dropout=self.dropout, bidirectional=False)
+
+        # word embedding from char rnn
+        self.word_dim = self.hidden_dim
+        self.pos_emb_dim = self.word_dim * 2
+        self.pos_emb = nn.Embedding(len(self.pos_dict), self.pos_emb_dim)
+        self.word_lstm = BoundaryLSTM(input_dim, self.word_dim, 1, self.dropout)
+
+
+        # stack hidden
+        self.stack_dim = self.hidden_dim
+        self.stack_lstm = BoundaryLSTM(self.word_dim, self.stack_dim, 1, self.dropout)
+
+        self.relation_emb_dim = self.word_dim // 2
+        self.relation_emb = nn.Embedding(len(self.relation_dict), self.relation_emb_dim)
+        # compose head and modifier
+
+        self.dependency_compsition = Composition(self.word_dim, self.relation_emb_dim)
+
+        # transition id to embedding
+        self.transition_emb_dim = self.hidden_dim // 4
+        self.transition_emb = nn.Embedding(len(self.transition_dict), self.transition_emb_dim)
+        # transition hidden
+        self.transition_lstm_dim = self.hidden_dim
+        self.transition_lstm = BoundaryLSTM(self.transition_emb_dim, self.transition_lstm_dim, 1, self.dropout)
+        #self.transition_lstm = BoundaryLSTM(len(self.transition_dict), self.transition_dim, self.dropout)
+
+        #self.encoder = QRNN(input_dim, feature_dim, 1,
+        #                    window_sizes=3, dropout=dropout)
+        self.transition_classifier = TransitionClassifier(self.buffer_dim + self.stack_dim * 2 + self.transition_lstm_dim,
+                                                          len(self.transition_dict), self.dropout)
+
 
     def _buffer(self, sentences):
         if isinstance(sentences, PackedSequence):
-            buffers, batch_sizes = sentences
-            buffers = self.projection(buffers)
-            buffers, lengths = pad_packed_sequence(PackedSequence(buffers, batch_sizes), batch_first=False)
+            buffers, lengths = pad_packed_sequence(sentences, batch_first=False)
         else:
             raise 'buffers must be PackedSequence'
 
         buffers = [list(torch.split(b.squeeze(1)[:length], 1, 0))
                    for b, length in zip(torch.split(buffers, 1, 1), lengths)]
 
-        for b in buffers:
-            b.append(self.sentence_end)
-
         buffers = [list(reversed(b)) for b in buffers]
 
-        return buffers, lengths
+        buffer_hiddens = [[self.buffer_lstm.begin()] for b in buffers]
+        max_length = lengths[0]
+        for t in range(max_length):
+            indexes = [i for i, _ in enumerate(buffers) if len(buffers[i]) > t]
+            inputs = [buffers[i][t] for i in indexes]
+            hidden = [buffer_hiddens[i][-1] for i in indexes]
+            new_hiddens = self.buffer_lstm(inputs, hidden)
+
+            for i, new in zip(indexes, new_hiddens):
+                buffer_hiddens[i].append(new)
+
+        return buffers, buffer_hiddens, lengths
 
 
-    def loss(self, sentences, gold_actions):
+    def _update_state(self, state_t, transition_id_t, transition_log_probs):
+        """
+        :param state_t: [state] * batch_size
+        :param transition_id_t: Variable(LongTensor(batch_size))
+        :param scores: [float] * batch_size
+        :return:
+        """
+        def word_emb(chars):
+            return chars[-1][:, 0:self.word_dim]
+
+        transition_t = self.transition_dict.get_word(transition_id_t.data)
+        # update char rnn
+        update_nodes, update_char_inputs, update_pos, update_char_hiddens = [], [], [], []
+        for state, t in zip(state_t, transition_t):
+            if t.action == Actions.SHIFT:
+                next_char = state.buffer.pop()
+                state.buffer_hidden.pop()
+                pos_id = Variable(torch.LongTensor([self.pos_dict.convert(t.label)]))
+                if self.use_cuda:
+                    pos_id = pos_id.cuda()
+                pos_emb = self.pos_emb(pos_id)
+                node = Node(len(state.nodes), [pos_emb], t.label)
+                state.nodes.append(node)
+
+                update_nodes.append(node)
+                update_char_inputs.append(next_char)
+                update_char_hiddens.append(node.chars[-1])
+
+            elif t.action == Actions.APPEND:
+                next_char = state.buffer.pop()
+                state.buffer_hidden.pop()
+                node = state.nodes[-1]
+
+                update_nodes.append(node)
+                update_char_inputs.append(next_char)
+                update_char_hiddens.append(node.chars[-1])
+
+        if len(update_nodes) > 0:
+            new_char_hidden = self.word_lstm(update_char_inputs, update_char_hiddens)
+            for node, new in zip(update_nodes, new_char_hidden):
+                node.chars.append(new)
+
+        need_comp_states, need_comp_heads, need_comp_modifiers, need_comp_relations = [], [], [], []
+        for state, t, tid, log_prob in zip(state_t, transition_t, transition_id_t.data, transition_log_probs.data):
+            state.score += log_prob[tid]
+            if t.action == Actions.SHIFT:
+                state.stack.append(word_emb(state.nodes[-1].chars))
+            elif t.action == Actions.APPEND:
+                state.stack.pop()
+                state.stack_hidden.pop()
+                state.stack.append(word_emb(state.nodes[-1].chars))
+            elif t.action == Actions.ARC_LEFT:
+                head = state.stack.pop()
+                modifier = state.stack.pop()
+                head_hidden = state.stack_hidden.pop()
+                modifier_hidden = state.stack_hidden.pop()
+                need_comp_states.append(state)
+                need_comp_heads.append(head)
+                need_comp_modifiers.append(modifier)
+                need_comp_relations.append(t.label)
+            elif t.action == Actions.ARC_RIGHT:
+                modifier = state.stack.pop()
+                head = state.stack.pop()
+                modifier_hidden = state.stack_hidden.pop()
+                head_hidden = state.stack_hidden.pop()
+                need_comp_states.append(state)
+                need_comp_heads.append(head)
+                need_comp_modifiers.append(modifier)
+                need_comp_relations.append(t.label)
+
+        # update composition node
+        if len(need_comp_states) > 0:
+            need_comp_relations = Variable(torch.LongTensor(self.relation_dict.convert(need_comp_relations)))
+            if self.use_cuda:
+                need_comp_relations = need_comp_relations.cuda()
+
+            relation_emb = self.relation_emb(need_comp_relations)
+            new_heads = self.dependency_compsition(need_comp_heads, need_comp_modifiers, relation_emb)
+            for state, new in zip(need_comp_states, new_heads):
+                state.stack.append(new)
+
+        # update stack hidden
+        new_stack_hiddens = self.stack_lstm([state.stack[-1] for state in state_t],
+                                            [state.stack_hidden[-1] for state in state_t])
+
+        for state, stack_hidden in zip(state_t, new_stack_hiddens):
+            state.stack_hidden.append(stack_hidden)
+
+        # update transition hidden
+        no_teacher_forcing = True if self.training and random.random() < self.teacher_forcing_ratio else False
+        if no_teacher_forcing:
+            _, transition_id_t = transition_log_probs.max(1)
+        transition_embs = self.transition_emb(transition_id_t)
+        new_transition_hiddens = self.transition_lstm(transition_embs,
+                                                      [state.transitions_hidden[-1] for state in state_t])
+
+        for state, transition, transition_hidden in zip(state_t, transition_t, new_transition_hiddens):
+            state.transitions.append(transition)
+            state.transitions_hidden.append(transition_hidden)
+
+        return state_t
+
+    def loss(self, sentences, gold_transitions):
         '''
         :param sentences: [length, batch, dim]
-        :param gold_actions: [length, batch]
+        :param gold_transitions: [transition] * batch_size
         :return:
         '''
 
-        State = namedtuple('State', ['buffer', 'stack', 'contexts', 'gold_actions'])
+        #sentences, _ = self.encoder(sentences)
 
-        buffers, lengths = self._buffer(sentences)
+        buffers, buffer_hiddens, lengths = self._buffer(sentences)
 
+        batch_size = len(lengths)
         # [batch_size * [stack_size * [node]]]
-        stacks = [[self.stack_base, self.stack_base]] * len(lengths)
-        contexts = [[self.context_begin]] * len(lengths)
-        num_action = gold_actions.size(0)
+        stacks = [[]] * batch_size
 
-        trans_loss = Variable(torch.FloatTensor([0]))
-        trans_correct = 0
-        trans_count = 0
+        states = [State([], buffer, buffer_hidden,
+                        [], [self.stack_lstm.begin(), self.stack_lstm.begin()],
+                        [], [self.transition_lstm.begin()])
+                  for buffer, buffer_hidden, stack in zip(buffers, buffer_hiddens, stacks)]
 
-
-        for t in range(num_action):
-            buffer_t, stack_t, action_t, context_t = [], [], [], []
-            for buf, stack, action, context in zip(buffers, stacks, gold_actions[t].data, contexts):
-                if action == Action.SHIFT or action == Action.REDUCE:
-                    buffer_t.append(buf)
-                    stack_t.append(stack)
-                    action_t.append(action)
-                    context_t.append(context)
-
-            context_t_output, trans_hyp = self.contexter(buffer_t, stack_t, context_t)
-
-            action_t = Variable(torch.LongTensor(action_t), requires_grad=False)
-            trans_loss += F.cross_entropy(trans_hyp,
-                                          action_t,
-                                          size_average=False,
-                                          ignore_index=Action.NONE)
-            trans_pred = trans_hyp.max(1)[1]
-            trans_correct += (trans_pred.data == action_t.data).sum()
-            trans_count += action_t.nelement()
-
-            reducing_lefts, reducing_rights, reducing_stacks, reducing_contexts = [], [], [], []
-            for buf, stack, action, context, context_output in zip(buffer_t, stack_t, action_t.data, context_t, context_t_output):
-                context.append(context_output)
-                if action == Action.SHIFT:
-                    stack.append(buf.pop())
-                elif action == Action.REDUCE:
-                    reducing_rights.append(stack.pop())
-                    reducing_lefts.append(stack.pop())
-                    reducing_contexts.append(context_output)
-                    reducing_stacks.append(stack)
+        if gold_transitions is None:
+            max_transition_length = lengths[0] * 2 - 1
+        else:
+            max_transition_length = gold_transitions.size(0)
 
 
-            if reducing_rights:
-                reduceds = iter(self.reduce(reducing_lefts, reducing_rights, reducing_contexts))
-                for reduced, stack in zip(reduceds, reducing_stacks):
-                    stack.append(reduced)
+        transition_loss = Variable(torch.FloatTensor([0]))
+        if self.use_cuda:
+            transition_loss = transition_loss.cuda()
 
-        return bundle([stack.pop() for stack in stacks])[0], trans_loss/trans_count, trans_correct, trans_count
+        transition_correct = 0
+        transition_count = 1e-5
 
+        pos_loss = [0]
+        pos_correct = 0
+        pos_count = 1e-5
 
-    def range_loss(self, sentences, gold_actions, begin, end):
-        '''
-        :param sentences: [length, batch, dim]
-        :param gold_actions: [length, batch]
-        :return:
-        '''
+        seg_loss = []
+        seg_correct = 0
+        seg_count = 1e-5
 
-        State = namedtuple('State', ['buffer', 'stack', 'contexts', 'gold_actions'])
+        for t in range(max_transition_length):
+            state_t, transition_id_t, mask_t = [], [], []
+            if gold_transitions is None:
+                for state in states:
+                    if len(state.buffer) > 1 or len(state.stack) > 1:
+                        state_t.append(state)
+                        mask_t.append(self.mask(len(state.buffer), len(state.stack),
+                                                state.transitions[-1] if len(state.transitions) > 0 else None))
 
-        buffers, lengths = self._buffer(sentences)
+            else:
 
-        # [batch_size * [stack_size * [node]]]
-        stacks = [[self.stack_base, self.stack_base]] * len(lengths)
-        contexts = [[self.context_begin]] * len(lengths)
-        num_action = gold_actions.size(0)
+                for state, transition_id in zip(states, gold_transitions[t].data):
+                    if transition_id >= 0:
+                        state_t.append(state)
+                        transition_id_t.append(transition_id)
+                        transition = self.transition_dict.get_word(transition_id)
+                        #assert self.check(state.buffer, state.stack, state.transitions, transition)
+                        mask_t.append(self.mask(len(state.buffer), len(state.stack),
+                                                state.transitions[-1] if len(state.transitions) > 0 else None))
+                transition_id_t = Variable(torch.LongTensor(transition_id_t), requires_grad=False)
+                if self.use_cuda:
+                    transition_id_t = transition_id_t.cuda()
 
-        trans_loss = Variable(torch.FloatTensor([0]))
-        trans_correct = 0
-        trans_count = 0
+            if len(state_t) == 0:
+                break
 
+            transition_mask = torch.cat(mask_t, 0)
+            transition_log_prob = self.transition_classifier([state.buffer_hidden for state in state_t],
+                                                         [state.stack_hidden for state in state_t],
+                                                         [state.transitions_hidden for state in state_t],
+                                                         transition_mask)
 
-        for t in range(min(num_action, end)):
-            buffer_t, stack_t, action_t, context_t = [], [], [], []
-            for buf, stack, action, context in zip(buffers, stacks, gold_actions[t].data, contexts):
-                if action == Action.SHIFT or action == Action.REDUCE:
-                    buffer_t.append(buf)
-                    stack_t.append(stack)
-                    action_t.append(action)
-                    context_t.append(context)
+            # caculate loss
+            if gold_transitions is None:
+                _, transition_argmax = transition_log_prob.max(1)
+                transition_loss += F.nll_loss(transition_log_prob,
+                                              transition_argmax,
+                                              size_average=False)
+            else:
+                transition_loss += F.nll_loss(transition_log_prob,
+                                                   transition_id_t,
+                                                   size_average=False)
 
-            context_t_output, trans_hyp = self.contexter(buffer_t, stack_t, context_t)
+            transition_count += transition_id_t.data.nelement()
 
-            action_t = Variable(torch.LongTensor(action_t), requires_grad=False)
+            self._update_state(state_t, transition_id_t, transition_log_prob)
+        return (transition_loss, transition_correct, transition_count), (sum(pos_loss)/pos_count, pos_correct, pos_count)
 
-            if t >= begin:
-                trans_loss += F.cross_entropy(trans_hyp,
-                                              action_t,
-                                              size_average=False,
-                                              ignore_index=Action.NONE)
-                trans_pred = trans_hyp.max(1)[1]
-                trans_correct += (trans_pred.data == action_t.data).sum()
-                trans_count += action_t.nelement()
+    def mask(self, buffer_len, stack_len, last_transition):
+        action_blacklist = set()
 
-            reducing_lefts, reducing_rights, reducing_stacks, reducing_contexts = [], [], [], []
-            for buf, stack, action, context, context_output in zip(buffer_t, stack_t, action_t.data, context_t, context_t_output):
-                context.append(context_output)
-                if action == Action.SHIFT:
-                    stack.append(buf.pop())
-                elif action == Action.REDUCE:
-                    reducing_rights.append(stack.pop())
-                    reducing_lefts.append(stack.pop())
-                    reducing_contexts.append(context_output)
-                    reducing_stacks.append(stack)
+        if buffer_len == 0:
+            action_blacklist.add(Actions.SHIFT)
+            action_blacklist.add(Actions.APPEND)
 
+        if stack_len == 0:
+            action_blacklist.add(Actions.APPEND)
 
-            if reducing_rights:
-                reduceds = iter(self.reduce(reducing_lefts, reducing_rights, reducing_contexts))
-                for reduced, stack in zip(reduceds, reducing_stacks):
-                    stack.append(reduced)
+        if last_transition is None:
+            action_blacklist.update([Actions.APPEND, Actions.ARC_LEFT, Actions.ARC_RIGHT])
+        elif last_transition.action == Actions.ARC_LEFT or last_transition.action == Actions.ARC_RIGHT:
+            action_blacklist.add(Actions.APPEND)
 
-        return trans_loss/trans_count, trans_correct, trans_count
+        if stack_len < 2:
+            action_blacklist.add(Actions.ARC_LEFT)
+            action_blacklist.add(Actions.ARC_RIGHT)
 
-    def check(self, actions, next, sentence_length):
+        def to_mask(t):
+            if t.action in action_blacklist:
+                return 0
+            return 1
 
-        shift_count = sum(1 for a in actions if a == Action.SHIFT)
-        reduce_count = sum(1 for a in actions if a == Action.REDUCE)
+        masked = Variable(torch.ByteTensor([[to_mask(t) for t in self.transition_dict.words]]), requires_grad=False)
+        if self.use_cuda:
+            masked = masked.cuda()
+        return masked
 
-        if next == Action.SHIFT: shift_count += 1
-        elif next == Action.REDUCE: reduce_count += 1
+    @staticmethod
+    def check(buffer, stack, prev_transitions, curr_transition):
 
-        return shift_count <= sentence_length and reduce_count < shift_count
+        if len(prev_transitions) == 0:
+            if curr_transition.action != Actions.SHIFT:
+                return False
+        else:
+            '''
+            if prev_transitions[-1].action in [Actions.SHIFT, Actions.APPEND] \
+                    and curr_transition.action == Actions.APPEND \
+                    and prev_transitions[-1].label != curr_transition.label:
+                return False
+            '''
 
-    def beam_parse(self, sentence, beam_size=10):
+            prev_action = prev_transitions[-1].action
+            curr_action = curr_transition.action
 
-        ParseState = namedtuple('ParseState', ['buffer', 'stack', 'contexts', 'actions', 'score'])
-        sen_len = sentence.size(0)
-        max_action = sen_len * 2 - 1
-        buffer = list(self.projection(sentence).split(1, 0))
-        buffer.append(self.sentence_end)
-        topk = [ParseState(list(reversed(buffer)), [self.stack_base, self.stack_base], [self.context_begin], [], 0.0)]
+            if curr_action == Actions.SHIFT:
+                if len(buffer) == 0:
+                    return False
+            elif curr_action == Actions.APPEND:
+                if prev_action != Actions.SHIFT and prev_action != Actions.APPEND:
+                    return False
+                if len(buffer) == 0 or len(stack) == 0:
+                    return False
 
-        for t in range(max_action):
-            #print([(len(state.buffer), len(state.stack), len(state.contexts), len(state.actions), state.score) for state in topk])
-            buffer_t = [b.buffer for b in topk]
-            stack_t = [b.stack for b in topk]
-            context_t = [b.contexts for b in topk]
-            action_t = [b.actions for b in topk]
+            elif curr_action == Actions.ARC_LEFT or curr_action == Actions.ARC_RIGHT:
+                if len(stack) < 2:
+                    return False
+        return True
 
-            context_output, action_hyp = self.contexter(buffer_t, stack_t, context_t)
+    def parse(self, sentences, beam_size=10):
 
-            action_prob = F.log_softmax(action_hyp).split(1, 0)
+        #sentences, _ = self.encoder(sentences)
 
-            all = [(state, context, action, state.score+probs[0, action].data[0])
-                   for action in [Action.SHIFT, Action.REDUCE] for state, context, probs in zip(topk, context_output, action_prob)]
+        buffers, buffer_hiddens, lengths = self._buffer(sentences)
 
-            sort_res = sorted(all, key=lambda i: i[3], reverse=True)
+        return [self.parse_one(buffer[0:length], buffer_hidden, beam_size)
+                for buffer, buffer_hidden, length in zip(buffers, buffer_hiddens, lengths)]
 
-            topk = []
-            reducing_left, reducing_right, reducing_context, reducing_stack = [], [], [], []
-            for state, context, action, score in sort_res:
-                if self.check(state.actions, action, sen_len):
-                    buffer = state.buffer.copy()
-                    stack = state.stack.copy()
-                    contexts = state.contexts.copy()
-                    actions = state.actions.copy()
-                    contexts.append(context)
-                    actions.append(action)
+    def parse_one(self, sentence, buffer_hidden, beam_size=10):
 
-                    if action == Action.SHIFT:
-                        stack.append(buffer.pop())
-                    elif action == Action.REDUCE:
-                        reducing_right.append(stack.pop())
-                        reducing_left.append(stack.pop())
-                        reducing_context.append(contexts[-1])
-                        reducing_stack.append(stack)
+        length = len(sentence) * 2 - 1
 
-                    topk.append(ParseState(buffer, stack, contexts, actions, score))
-                    if len(topk) > beam_size:
-                        break
+        topK = []
+        topK.append(State([], sentence, buffer_hidden,
+                          [], [self.stack_lstm.begin(), self.stack_lstm.begin()],
+                          [], [self.transition_lstm.begin()]))
 
-            if reducing_right:
-                reduceds = self.reduce(reducing_left, reducing_right, reducing_context)
-                for reduced, stack in zip(reduceds, reducing_stack):
-                    stack.append(reduced)
+        next1 = []
 
-        return topk[0].actions
+        for step in range(length):
+            transition_mask = torch.cat([self.mask(len(state.buffer),
+                                                   len(state.stack),
+                                                   state.transitions[-1] if len(state.transitions) else None) for state in topK],
+                                        0)
+            transition_log_prob = self.transition_classifier([state.buffer_hidden for state in topK],
+                                                         [state.stack_hidden for state in topK],
+                                                         [state.transitions_hidden for state in topK],
+                                                         transition_mask)
+            _, transition_topk = transition_log_prob.topk(self.topk, 1)
 
-class Config:
-    def __init__(self):
-        self.d_hidden = 128
-        self.d_proj = 256
-        self.d_tracker = 128
-        self.predict = True
+            step1, step2 = [], []
+            for state, log_probs in zip(topK, transition_log_prob.data):
+                for transition_id, log_prob in enumerate(log_probs):
+                    transition = self.transition_dict.get_word(transition_id)
+                    if self.check(state.buffer, state.stack, state.transitions, transition):
+                        if transition.action in [Actions.SHIFT, Actions.ARC_LEFT, Actions.ARC_RIGHT]:
+                            step1.append((state, transition, log_probs, state.score+log_prob))
+                        else:
+                            # append = shift + reduce
+                            step2.append((state, transition, log_probs, state.score+log_prob))
+
+            sorted_cands = sorted(step1 + next1, key=lambda c: c[-1], reverse=True)
+
+            topK = sorted_cands[0: beam_size]
+
+            transition_id_t = Variable(
+                torch.LongTensor(self.transition_dict.convert([transition for _, transition, _, _ in topK])))
+            if self.use_cuda:
+                transition_id_t = transition_id_t.cuda()
+
+            transition_log_prob = Variable(
+                torch.cat([log_prob.unsqueeze(0) for _, _, log_prob, _ in topK], 0))
+
+            topK = self._update_state([copy.deepcopy(state) for state, _, _, _ in topK],
+                                      transition_id_t,
+                                      transition_log_prob)
+            next1 = step2
+
+        return topK[0].transitions, topK[0].score
+
+class ParserConfig(TaskConfig):
+
+    def __init__(self, name, train_paths, test_paths):
+        self.name = name
+        self.train_paths = train_paths
+        self.test_paths = test_paths
+
+        self.hidden_dim = 128
+        self.dropout = 0.2
+        self.shared_weight_decay = 1e-6
+        self.task_weight_decay = 1e-6
+
+        self._loader = None
+
+    def loader(self):
+        if self._loader is None:
+            self._loader = CTBParseData(self.train_paths, self.test_paths)
+
+        return self._loader
+
+    def create_task(self, shared_vocab, shared_encoder):
+
+        loader = self.loader()
+
+        return ParserTask(self.name,
+                          shared_encoder, shared_vocab,
+                          loader.transition_dict, loader.relation_dict, loader.pos_dict,
+                          self.hidden_dim,
+                          self.dropout,
+                          self.shared_weight_decay,
+                          self.task_weight_decay)
 
 
 class ParserTask(Task):
     def __init__(self, name, encoder, vocab,
+                 transition_dict, relation_dict, pos_dict,
                  hidden_dim,
-                 tracker_dim,
-                 dropout = 0.2,
-                 general_weight_decay=1e-6,
-                 task_weight_decay=1e-6):
+                 dropout,
+                 shared_weight_decay,
+                 task_weight_decay):
         super(ParserTask, self).__init__()
 
         self.name = name
         self.vocab = vocab
-        self.general_encoder = encoder
-        self.tracker_dim = tracker_dim
+        self.transition_dict = transition_dict
+        self.relation_dict = relation_dict
+        self.pos_dict = pos_dict
+        self.shared_encoder = encoder
+
+        self.hidden_dim = hidden_dim
         self.dropout = dropout
-        self.spinn = SPINN(hidden_dim * 2, hidden_dim, tracker_dim, dropout)
+        self.shared_weight_decay = shared_weight_decay
+        self.task_weight_decay = task_weight_decay
 
-        self.params = [{'params': self.general_encoder.parameters(), 'weight_decay': general_weight_decay},
+        self.use_cuda = False
+
+        self.parser = ArcStandard(self.shared_encoder.output_dim(),
+                                  self.hidden_dim,
+                                  self.transition_dict,
+                                  self.relation_dict,
+                                  self.pos_dict,
+                                  self.dropout)
+
+
+        self.params = [{'params': self.shared_encoder.parameters(), 'weight_decay': self.shared_weight_decay},
                        #{'params': self.task_encoder.parameters(), 'weight_decay': task_weight_decay},
-                       {'params': self.spinn.parameters(), 'weight_decay': task_weight_decay}]
+                       {'params': self.parser.parameters(), 'weight_decay': self.task_weight_decay}]
 
-    def forward(self, sentences, actions):
+    def forward(self, sentences, transitions):
         sentences, gazetteers = sentences
 
-        feature = self.general_encoder(sentences, gazetteers)
-        return self.spinn.loss(feature, actions)
+        feature = self.shared_encoder(sentences, gazetteers)
+        return self.parser.loss(feature, transitions)
 
-    def loss(self, sentences, actions):
+    def _to_cuda(self, batch_data):
 
-        root, loss, acc, count = self.forward(sentences, actions)
+        (sentences, gazes), transitions = batch_data
 
-        return loss, acc, count
+        return ((PackedSequence(sentences.data.cuda(), sentences.batch_sizes),
+                 PackedSequence(gazes.data.cuda(), gazes.batch_sizes)),
+                transitions.cuda() if transitions else None
+                )
 
-    def range_loss(self, sentences, actions, begin, end):
+    def loss(self, batch_data):
+
+        if self.use_cuda:
+            batch_data = self._to_cuda(batch_data)
+
+        sentences, reference = batch_data
+        (loss, acc, count), _ = self.forward(sentences, reference)
+
+        return loss/count
+
+    def parse(self, sentences, beam_size=5):
         sentences, gazetteers = sentences
-        feature = self.general_encoder(sentences, gazetteers)
-        return self.spinn.range_loss(feature, actions, begin, end)
 
-    def parse(self, sentences):
-        sentences, gazetteers = sentences
+        features = self.shared_encoder(sentences, gazetteers)
 
-        feature = self.general_encoder(sentences, gazetteers)
+        return self.parser.parse(features, beam_size)
 
-        features, lengths = pad_packed_sequence(feature, batch_first=True)
+    def sample(self, batch_data):
 
-        return [self.spinn.beam_parse(sentence[0,:length]) for sentence, length in zip(features.split(1, 0), lengths)]
+        if self.use_cuda:
+            batch_data = self._to_cuda(batch_data)
 
-    @staticmethod
-    def tree2str(words, actions):
-        class Node:
-            def __init__(self, value, left=None, right=None):
-                self.value = value
-                self.left = left
-                self.right = right
+        sentences, gold_trans = batch_data
+        pred_transitions_and_score = self.parse(sentences, 5)
 
-        stack = []
+        sentences, lengths = pad_packed_sequence(sentences[0], batch_first=True, padding_value=-1)
+        sentences = [self.vocab.get_word(sentence[0, :length].data.numpy())
+                     for sentence, length in zip(sentences.split(1, 0), lengths)]
 
-        wi = 0
-        for a in actions:
-            if a == Action.SHIFT:
-                stack.append(Node(words[wi]))
-                wi += 1
-            elif a == Action.REDUCE:
-                right = stack.pop()
-                left = stack.pop()
-                stack.append(Node(None, left, right))
+        if gold_trans is None:
+            return ['score=%f\t%s\n' % (score, UDTree.create(sentence, pred).to_line())
+                    for sentence, (pred, score) in zip(sentences, pred_transitions_and_score)]
+        else:
+            gold_trans = [gold_trans[:, sen_id] for sen_id in range(len(sentences))]
+            gold_trans = [t.masked_select(t >= 0) for t in gold_trans]
 
-        root = stack[-1]
+            samples = [(score, UDTree.create(sentence, self.transition_dict.get_word(gold.data)).to_line(),
+                        UDTree.create(sentence, pred).to_line())
+                       for sentence, gold, (pred, score) in zip(sentences, gold_trans, pred_transitions_and_score)]
 
-        def dfs(node):
-            if node.value:
-                return node.value
-            else:
-                return '(' + dfs(node.left) + ' ' + dfs(node.right) + ')'
-
-        return dfs(root)
-
-    def sample(self, sentences, vocab):
-
-        batch_actions = task.parse(sentences)
-        sentences, lengths = pad_packed_sequence(sentences[0], batch_first=True)
-        sentences = [sentence[0, :length] for sentence, length in zip(sentences.split(1, 0), lengths)]
-        return [self.tree2str(vocab.get_word(sentence.data.numpy()), actions)
-                for sentence, actions in zip(sentences, batch_actions)]
+            return ['score=%f\nref:  %s\npred: %s\n' % (score, gold, pred) for score, gold, pred in samples if gold != pred]
 
 
 
-class CTBParser(Loader):
+
+    def evaluation(self, data):
+
+        seg_correct = 0
+        pos_correct = 0
+
+        uas_correct = 0
+        las_correct = 0
+
+        gold_count = 0
+        pred_count = 0
+
+        labeled_arc_correct = 0
+        unlabeled_arc_correct = 0
+
+
+        for batch in data:
+            if self.use_cuda:
+                batch = self._to_cuda(batch)
+
+            sentences, transitions = batch
+            pred_trans = self.parse(sentences)
+
+            sentences, lengths = pad_packed_sequence(sentences[0], batch_first=True, padding_value=-1)
+            sentences = [sentence[0, :length] for sentence, length in zip(sentences.split(1, 0), lengths)]
+            for sen_id, (sentence, (sen_pred_trans, score)) in enumerate(zip(sentences, pred_trans)):
+                sen_gold_trans = transitions[:, sen_id]
+                sen_gold_trans = sen_gold_trans.masked_select(sen_gold_trans >= 0)
+
+                gold_tree = UDTree.create(self.vocab.get_word(sentence.data.numpy()), self.transition_dict.get_word(sen_gold_trans.data))
+                pred_tree = UDTree.create(self.vocab.get_word(sentence.data.numpy()), sen_pred_trans)
+
+                gold_nodes = gold_tree.nodes
+                pred_nodes = pred_tree.nodes
+
+                gold_count += len(gold_nodes)
+                pred_count += len(pred_nodes)
+
+                gold_char_index, gold_word_index = 0, 0
+                pred_char_index, pred_word_index = 0, 0
+
+                matched_nodes = []
+
+                while gold_word_index < len(gold_nodes) and pred_word_index < len(pred_nodes):
+
+                    if gold_nodes[gold_word_index].chars == pred_nodes[pred_word_index].chars:
+                        seg_correct += 1
+                        matched_nodes.append((gold_word_index, pred_word_index))
+                        if gold_nodes[gold_word_index].pos == pred_nodes[pred_word_index].pos:
+                            pos_correct += 1
+
+                    gold_char_index += len(gold_nodes[gold_word_index])
+                    pred_char_index += len(pred_nodes[pred_word_index])
+
+                    gold_word_index += 1
+                    pred_word_index += 1
+
+                    while gold_char_index != pred_char_index:
+                        if gold_char_index < pred_char_index:
+                            gold_char_index += len(gold_nodes[gold_word_index])
+                            gold_word_index += 1
+                        elif gold_char_index > pred_char_index:
+                            pred_char_index += len(pred_nodes[pred_word_index])
+                            pred_word_index += 1
+
+
+                pred2gold = {pred: gold for gold, pred in matched_nodes}
+
+                for gold_modifier, pred_modifier in matched_nodes:
+                    pred_relation = pred_nodes[pred_modifier].relation
+                    pred_head = pred_nodes[pred_modifier].head_index
+
+                    gold_head = gold_nodes[gold_modifier].head_index
+                    gold_relation = gold_nodes[gold_modifier].relation
+
+                    if (pred_head == gold_head == -1) or pred2gold.get(pred_head, -100) == gold_head:
+                        unlabeled_arc_correct += 1
+                        if gold_relation == pred_relation:
+                            labeled_arc_correct += 1
+
+        safe_div = lambda a, b : a / (b + 1e-10)
+        seg_prec = safe_div(seg_correct, pred_count)
+        seg_recall = safe_div(seg_correct, gold_count)
+        seg_f = safe_div(2*seg_prec*seg_recall, seg_prec+seg_recall)
+
+        pos_prec = safe_div(pos_correct, pred_count)
+        pos_recall = safe_div(pos_correct, gold_count)
+        pos_f = safe_div(2*pos_prec*pos_recall, pos_prec+pos_recall)
+
+        unlabeled_prec = safe_div(unlabeled_arc_correct, pred_count)
+        unlabeled_recall = safe_div(unlabeled_arc_correct, gold_count)
+        unlabeled_f = safe_div(2*unlabeled_prec*unlabeled_recall, unlabeled_prec+unlabeled_recall)
+
+        labeled_prec = safe_div(labeled_arc_correct, pred_count)
+        labeled_recall = safe_div(labeled_arc_correct, gold_count)
+        labeled_f = safe_div(2*labeled_prec*labeled_recall, labeled_prec+labeled_recall)
+
+
+        return {'seg prec':seg_prec, 'seg recall':seg_recall, 'seg F-score':seg_f,
+                'pos pred':pos_prec, 'pos recall':pos_recall, 'pos F-score':pos_f,
+                'ua prec':unlabeled_prec, 'ua recall':unlabeled_recall, 'ua F-score':unlabeled_f,
+                'la prec':labeled_prec, 'la recall': labeled_recall, 'la F-score':labeled_f
+                }
+
+
+class CTBParseData(Loader):
     def __init__(self, train_paths, test_paths):
-        self.train_data, self.word_counts, self.test_data = self.load(train_paths, test_paths)
+        self.train_data = self.load(train_paths)
+
+        self.word_counts = defaultdict(int)
+        self.pos_counts = defaultdict(int)
+        self.transition_counts = defaultdict(int)
+        self.relation_counts = defaultdict(int)
+        for chars, transitions in self.train_data:
+            for t in transitions:
+                self.transition_counts[t] += 1
+
+                if t.action == Actions.SHIFT:
+                    self.pos_counts[t.label] += 1
+                elif t.action in [Actions.ARC_LEFT, Actions.ARC_RIGHT]:
+                    self.relation_counts[t.label] += 1
+
+            for char in chars:
+                self.word_counts[char] += 1
+
+        self.test_data = self.load(test_paths)
 
         self.train_data = sorted(self.train_data, key=lambda item: len(item[0]), reverse=True)
-        self.test_data = sorted(self.test_data, key=lambda item: len(item[0]), reverse=True )
+        self.test_data = sorted(self.test_data, key=lambda item: len(item[0]), reverse=True)
 
-    def load(self, train_paths, test_paths):
-        train_data = []
-        for path in train_paths:
+        self.min_count = 5
+        transitions = set()
+
+        def convert(t, count):
+            if t.action == Actions.SHIFT:
+                if self.pos_counts[t.label] > self.min_count:
+                    return t
+                else:
+                    return Transition(t.action, 'UNK_POS')
+            elif t.action in [Actions.ARC_LEFT, Actions.ARC_RIGHT]:
+                if self.relation_counts[t.label] > self.min_count:
+                    return t
+                else:
+                    return Transition(t.action, 'UNK_RELATION')
+            else:
+                return t
+
+        transitions = set(convert(k, v) for k, v in self.transition_counts.items())
+
+        self.transition_dict = Vocab(transitions, unk=None)
+        self.pos_dict = Vocab([k for k, v in self.pos_counts.items() if v > self.min_count], unk='UNK_POS')
+
+        relations = set([t.label for t in transitions if t.action in [Actions.ARC_LEFT, Actions.ARC_RIGHT]])
+        self.relation_dict = Vocab(relations, unk=None)
+
+    def load(self, paths):
+        data = []
+        bad_data_count = 0
+        for path in paths:
             with open(path) as file:
+                sentences = file.read().strip().split('\n\n')
+                # uniq operation
+                #sentences = set(sentences)
+                for sentence in sentences:
+                    words = sentence.strip().split('\n')
+                    if len(words) > 0:
+                        words = [word.split('\t') for word in words]
+                        words = [([char if type == '@zh_char@' else type for type, char in replace_entity(word)], pos, parent_id, relation)
+                                 for _, word, _, pos, _, _, parent_id, relation, _, _ in words]
+                        tree = UDTree.parse_stanford_format(words)
 
-                for line in file:
-                    line = line.strip()
-                    if len(line) > 0:
-                        words, transitions = line.split('\t\t')
-                        if len(words) > 0:
-                            words = words.split()
-                            transitions = transitions.split()
-                            train_data.append((words, transitions))
+                        if tree is None:
+                            bad_data_count += 1
+                        else:
+                            data.append(tree.linearize())
 
-                word_counts = defaultdict(int)
-                for words, _ in train_data:
-                    for w in words:
-                        word_counts[w] += 1
-
-        test_data = []
-        for path in test_paths:
-            with open(path) as file:
-                for line in file:
-                    line = line.strip()
-                    if len(line) > 0:
-                        words, transitions = line.split('\t\t')
-                        if len(words) > 0:
-                            words = words.split()
-                            transitions = transitions.split()
-                            test_data.append((words, transitions))
-
-        return train_data, word_counts, test_data
+        print(bad_data_count)
+        return data
 
     def _batch(self, data, vocab, gazetteers, batch_size):
 
@@ -585,20 +1034,21 @@ class CTBParser(Loader):
             batch = sorted(batch, key=lambda item: len(item[0]), reverse=True)
             sen_lens = [len(s) for s, _ in batch]
             max_sen_len = max(sen_lens)
-            max_tran_len = max([len(t) for _, t in batch])
+            max_tran_len = max([len(trans) for _, trans in batch])
             sentences = torch.LongTensor(max_sen_len, len(batch)).fill_(0)
             gazes = torch.FloatTensor(max_sen_len, len(batch), gazetteers_dim).fill_(0)
-            actions = torch.LongTensor(max_tran_len, len(batch)).fill_(0)
+            transitions = torch.LongTensor(max_tran_len, len(batch)).fill_(-1)
+
             for id, (words, trans) in enumerate(batch):
                 sen_len = len(words)
-                sentences[:sen_len, id] = torch.from_numpy(vocab.convert(words))
-                gazes[0:sen_len, id] = torch.from_numpy(
-                    np.concatenate([gazetteer.convert(words) for gazetteer in gazetteers], -1))
+                sentences[:sen_len, id] = torch.LongTensor(vocab.convert(words))
+                gazes[0:sen_len, id] = torch.cat([torch.FloatTensor(gazetteer.convert(words)) for gazetteer in gazetteers], -1)
                 tran_len = len(trans)
-                actions[:tran_len, id] = torch.LongTensor([Action.convert(t) for t in trans])
+                transitions[:tran_len, id] = torch.LongTensor(self.transition_dict.convert(trans))
+
             yield ((pack_padded_sequence(Variable(sentences), sen_lens),
                     pack_padded_sequence(Variable(gazes), sen_lens)),
-                    Variable(actions))
+                   Variable(transitions))
 
     def batch_train(self, vocab, gazetteers, batch_size):
         return self._batch(self.train_data, vocab, gazetteers, batch_size)
@@ -606,158 +1056,111 @@ class CTBParser(Loader):
     def batch_test(self, vocab, gazetteers, batch_size):
         return self._batch(self.test_data, vocab, gazetteers, batch_size)
 
-class ParserConfig:
+
+class RawData(Loader):
+    def __init__(self, train_paths, test_paths):
+        self.train_data = self.load(train_paths)
+
+        self.word_counts = defaultdict(int)
+        for chars in self.train_data:
+            for char in chars:
+                self.word_counts[char] += 1
+
+        self.test_data = self.load(test_paths)
+
+        self.train_data = sorted(self.train_data, key=lambda item: len(item), reverse=True)
+        self.test_data = sorted(self.test_data, key=lambda item: len(item), reverse=True)
+
+        self.num_pos = 10
+        pos_list = ['pos-%d' % p for p in range(self.num_pos)]
+
+        self.num_relation = 10
+        relation_list = ['rel-%d' % r for r in range(self.num_relation)]
+        transitions = list(itertools.chain.from_iterable([
+            [Transition(Actions.SHIFT, p) for p in pos_list],
+            [Transition(Actions.APPEND, None)],
+            [Transition(Actions.ARC_LEFT, r) for r in relation_list],
+            [Transition(Actions.ARC_RIGHT, r) for r in relation_list]
+        ]))
+
+        self.transition_dict = Vocab(transitions, unk=None)
+
+        self.pos_dict = Vocab(pos_list, unk=None)
+
+        self.relation_dict = Vocab(relation_list, unk=None)
+
+    def load(self, paths):
+        data = []
+        bad_data_count = 0
+        for path in paths:
+            with open(path) as file:
+                # uniq operation
+                #sentences = set(sentences)
+                for line in file:
+                    words = line.strip().split('\n')
+                    chars = [char if type == '@zh_char@' else type
+                             for word in words for type, char in replace_entity(word)]
+                    if len(chars) > 0:
+                        data.append(chars)
+        return data
+
+    def _batch(self, data, vocab, gazetteers, batch_size):
+
+        gazetteers_dim = sum([c.length() for c in gazetteers])
+
+        for begin in range(0, len(data), batch_size):
+            batch = data[begin:begin+batch_size]
+
+            batch = sorted(batch, key=lambda item: len(item), reverse=True)
+            sen_lens = [len(s) for s in batch]
+            max_sen_len = max(sen_lens)
+            sentences = torch.LongTensor(max_sen_len, len(batch)).fill_(0)
+            gazes = torch.FloatTensor(max_sen_len, len(batch), gazetteers_dim).fill_(0)
+
+            for id, words in enumerate(batch):
+                sen_len = len(words)
+                sentences[:sen_len, id] = torch.LongTensor(vocab.convert(words))
+                gazes[0:sen_len, id] = torch.cat([torch.FloatTensor(gazetteer.convert(words)) for gazetteer in gazetteers], -1)
+
+            yield ((pack_padded_sequence(Variable(sentences), sen_lens),
+                    pack_padded_sequence(Variable(gazes), sen_lens)),
+                   None)
+
+    def batch_train(self, vocab, gazetteers, batch_size):
+        return self._batch(self.train_data, vocab, gazetteers, batch_size)
+
+    def batch_test(self, vocab, gazetteers, batch_size):
+        return self._batch(self.test_data, vocab, gazetteers, batch_size)
+
+
+class SelfParserConfig(TaskConfig):
 
     def __init__(self, name, train_paths, test_paths):
         self.name = name
         self.train_paths = train_paths
         self.test_paths = test_paths
+
         self.hidden_dim = 128
-        self.tracker_dim = 128
-        self.predict = True
+        self.dropout = 0.2
+        self.shared_weight_decay = 1e-6
+        self.task_weight_decay = 1e-6
 
+        self._loader = None
 
-class EncoderConfig:
-    def __init__(self):
-        self.max_vocab_size = 5000
-        self.embedding_dim = 128
-        self.hidden_mode = 'QRNN'
-        self.num_hidden_layer = 1
-        self.hidden_dim = 128
-        self.window_sizes = [2, 2]
+    def loader(self):
+        if self._loader is None:
+            self._loader = RawData(self.train_paths, self.test_paths)
 
-        self.dropout = 0.3
+        return self._loader
 
-class MultiTaskConfig:
+    def create_task(self, shared_vocab, shared_encoder):
 
-    def __init__(self):
-        self.encoder_config = EncoderConfig()
-        self.batch_size = 16
-        self.data_root = '/Users/sunqf/startup/quotesbot/nlp-data/chinese_segment/data/'
-        #self.data_root = '/home/sunqf/Work/chinese_segment/data'
+        loader = self.loader()
 
-        import os
-        '''
-        people2014 = TaggerConfig('people2014', [os.path.join(self.data_root, 'train/people2014.txt')], [], False)
-        ctb = TaggerConfig('ctb8',
-                           [os.path.join(self.data_root, 'train/ctb.train')],
-                           [os.path.join(self.data_root, 'gold/ctb.gold')],
-                           False)
-        msr = TaggerConfig('msr',
-                           [os.path.join(self.data_root, 'train/msr_training.utf8')],
-                           [os.path.join(self.data_root, 'gold/msr_test_gold.utf8')],
-                           False)
-
-        pku = TaggerConfig('pku',
-                           [os.path.join(self.data_root, 'train/pku_training.utf8')],
-                           [os.path.join(self.data_root, 'gold/pku_test_gold.utf8')],
-                           False)
-
-        nlpcc = TaggerConfig('nlpcc',
-                             [os.path.join(self.data_root, 'train/nlpcc2016-word-seg-train.dat'),
-                                   os.path.join(self.data_root, 'train/nlpcc2016-wordseg-dev.dat')],
-                             #[os.path.join(self.data_root, 'gold/nlpcc2016-wordseg-test.dat')],
-                             [],
-                             False)
-
-
-        ctb_pos = TaggerConfig('ctb_pos',
-                               [os.path.join(self.data_root, 'pos/ctb.pos.train')],
-                               [os.path.join(self.data_root, 'pos/ctb.pos.gold')],
-                               True)
-        '''
-
-        self.ctb_parser = ParserConfig('ctb_parser',
-                                  [os.path.join(self.data_root, 'parser/ctb.parser.train')],
-                                  [os.path.join(self.data_root, 'parser/ctb.parser.gold')])
-
-        self.tasks = [self.ctb_parser]
-
-        self.valid_size = 1000//self.batch_size
-
-        # 字属性字典
-        self.char_attr = './dict/word-type'
-        # 词集合
-        self.wordset = {}
-        self.model_prefix = 'model/model'
-
-        self.eval_step = 500
-
-        self.epoches = 10
-
-
-config = MultiTaskConfig()
-encoder_config = config.encoder_config
-parser_config = config.ctb_parser
-
-parser_data = CTBParser(parser_config.train_paths, parser_config.test_paths)
-
-vocab = Vocab.build(parser_data.word_counts, encoder_config.max_vocab_size)
-
-char2attr = CharacterAttribute.load(config.char_attr)
-gazetteers = [char2attr] + [Gazetteer.load(name, path) for name, path in config.wordset]
-
-encoder = Encoder(len(vocab), gazetteers, encoder_config.embedding_dim,
-                  encoder_config.hidden_mode, encoder_config.hidden_dim,
-                  encoder_config.num_hidden_layer, encoder_config.window_sizes,
-                  encoder_config.dropout)
-
-task = ParserTask('ctb_parser', encoder, vocab, parser_config.hidden_dim, parser_config.tracker_dim)
-
-train_data = list(parser_data.batch_train(vocab, gazetteers, config.batch_size))
-test_data = list(parser_data.batch_test(vocab, gazetteers, config.batch_size))
-
-valid_data = []
-train_data, valid_data = train_test_split(train_data, test_size=1000//config.batch_size)
-
-optimzer = torch.optim.Adam(task.params)
-
-for epoch in range(10):
-
-    total_loss = 0.
-    total_correct = 0.
-    total_count = 0
-
-    seq_step = 50
-    for batch_id, batch in enumerate(train_data, start=1):
-        sentences, transitions = batch
-        for begin in range(0, transitions.size(0), seq_step):
-            task.train()
-            task.zero_grad()
-
-            loss, correct, count = task.range_loss(sentences, transitions, begin, begin+seq_step)
-            total_loss += loss.data[0] * count
-            total_correct += correct
-            total_count += count
-
-            loss.backward()
-            optimzer.step()
-
-        if batch_id % 200 == 0:
-            valid_loss = 0.
-            valid_correct = 0.
-            valid_count = 0
-            task.eval()
-            for valid_batch in valid_data:
-                sentences, transitions = batch
-                loss, correct, count = task.loss(sentences, transitions)
-
-                valid_loss += loss.data[0] * count
-                valid_correct += correct
-                valid_count += count
-
-            print('train loss=%f\tacc=%0.6f\nvalid=%f\tacc=%0.6f' %
-                  (total_loss / total_count, total_correct / total_count,
-                   valid_loss / valid_count, valid_correct / valid_count))
-
-            total_loss = 0.
-            total_correct = 0.
-            total_count = 0
-
-            #sample
-            import random
-            sentences, transitions = valid_data[random.randint(0, len(valid_data)-1)]
-            task.eval()
-            print('\n'.join(task.sample(sentences, vocab)))
-
-
+        return ParserTask(self.name,
+                          shared_encoder, shared_vocab,
+                          loader.transition_dict, loader.relation_dict, loader.pos_dict,
+                          self.hidden_dim,
+                          self.dropout,
+                          self.shared_weight_decay,
+                          self.task_weight_decay)

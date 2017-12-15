@@ -9,12 +9,17 @@ class Module(nn.Module):
         self.use_cuda = False
 
     def cuda(self, device):
-        super(Task, self).cuda(device)
         self.use_cuda = True
+        for module in self.children():
+            if isinstance(module, Module):
+                module.use_cuda = True
+        return super(Module, self).cuda(device)
+
 
     def cpu(self):
-        super(Task, self).cpu()
         self.use_cuda = False
+        return super(Module, self).cpu()
+
 
 
 class Task(Module):

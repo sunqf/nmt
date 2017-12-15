@@ -1,7 +1,7 @@
 import torch
 
 from ..layer.encoder import Encoder
-from .parser3 import ParserConfig, SelfParserConfig
+from .parser import ParserConfig, SelfParserConfig
 from .tagger import TaggerConfig
 from ..util.vocab import Vocab, CharacterAttribute, Gazetteer
 from sklearn.model_selection import train_test_split
@@ -102,7 +102,7 @@ class EncoderConfig:
         self.max_vocab_size = 5000
         self.embedding_dim = 128
         self.hidden_mode = 'LSTM'
-        self.num_hidden_layer = 1
+        self.num_hidden_layer = 2
         self.hidden_dim = 128
         self.window_sizes = [2, 2]
 
